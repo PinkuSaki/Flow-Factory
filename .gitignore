@@ -42,3 +42,6 @@ dataset/**/videos*
 dataset/**/*.mp4
 dataset/**/*.avi
 dataset/**/*.mov
+
+# Models
+models/

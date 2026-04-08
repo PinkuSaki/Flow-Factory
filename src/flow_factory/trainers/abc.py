@@ -179,8 +179,9 @@ class BaseTrainer(ABC):
     
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
+        optimizer_params = self.adapter.get_optimizer_param_groups()
         self.optimizer = torch.optim.AdamW(
-            self.adapter.get_trainable_parameters(),
+            optimizer_params,
             lr=self.training_args.learning_rate,
             betas=self.training_args.adam_betas,
             weight_decay=self.training_args.adam_weight_decay,

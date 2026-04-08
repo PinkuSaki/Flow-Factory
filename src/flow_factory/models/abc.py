@@ -1747,6 +1747,15 @@ class BaseAdapter(ABC):
                 params.extend(filter(lambda p: p.requires_grad, component.parameters()))
         return params
 
+    def get_optimizer_param_groups(self) -> List[Union[torch.nn.Parameter, Dict[str, Any]]]:
+        """
+        返回优化器参数配置。
+
+        默认直接返回可训练参数列表；子类可覆盖为 param groups 形式，
+        例如 ``[{\"params\": [...], \"lr\": ...}, ...]``。
+        """
+        return self.get_trainable_parameters()
+
     def log_trainable_parameters(self):
         """Log trainable parameter statistics for all target components."""
         for comp_name in self.model_args.target_components:

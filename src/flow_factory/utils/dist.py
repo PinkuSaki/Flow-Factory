@@ -48,6 +48,13 @@ def get_world_size() -> int:
     
     return 1
 
+
+def _is_dist_ready(accelerator: Optional[Accelerator] = None) -> bool:
+    """检查当前是否真的处于可通信的分布式上下文。"""
+    if accelerator is not None and accelerator.num_processes <= 1:
+        return False
+    return dist.is_available() and dist.is_initialized()
+
 # -----------------------------------Tensor Gathering Utils---------------------------------------
 def all_gather_tensor_list(
     accelerator: Accelerator,
@@ -76,6 +83,11 @@ def all_gather_tensor_list(
     """
     if not tensor_list:
         return []
+
+    if not _is_dist_ready(accelerator):
+        tensor_dtype = tensor_list[0].dtype if dtype is None else dtype
+        target_device = torch.device(device)
+        return [t.to(device=target_device, dtype=tensor_dtype) for t in tensor_list]
     
     assert all(isinstance(t, torch.Tensor) for t in tensor_list), "All elements in tensor_list must be torch.Tensor"
     assert all(t.dim() == tensor_list[0].dim() for t in tensor_list), "All tensors must have the same number of dimensions"
@@ -151,6 +163,18 @@ def all_gather_nested_tensor_list(
         2. Gather the structure information - **length of the list** and **the lengths of inner lists** (2 times)
         3. Reconstruct the nested structure using the gathered structure info
     """
+    if not _is_dist_ready(accelerator):
+        tensor_dtype = None
+        for sublist in nested_tensor_list:
+            if sublist:
+                tensor_dtype = sublist[0].dtype if dtype is None else dtype
+                break
+        target_device = torch.device(device)
+        return [
+            [t.to(device=target_device, dtype=tensor_dtype or t.dtype) for t in sublist]
+            for sublist in nested_tensor_list
+        ]
+
     # 1. Flatten the local nested structure into a single list of tensors
     # [[t1, t2], [t3]] -> [t1, t2, t3]
     flat_tensor_list = [t for sublist in nested_tensor_list for t in sublist]
@@ -225,6 +249,9 @@ def gather_samples(
     """
     if not samples:
         return []
+
+    if not _is_dist_ready(accelerator):
+        return samples
     
     sample_cls = samples[0].__class__ # Assume all samples are of the same class
     device = torch.device(device)
@@ -249,6 +276,7 @@ def gather_samples(
                 nested_tensor_list=field_values,
                 device=device
             )
+            d[field_name].extend(gathered_field_values)
         else:
             # Gather other objects using accelerate's gather_object
             gathered_field_values = gather_object(field_values)

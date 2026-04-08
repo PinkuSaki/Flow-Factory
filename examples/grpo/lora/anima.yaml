@@ -1,0 +1,113 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/accelerate_configs/fsdp2.yaml  # 显存足够时也可切到 deepspeed 配置
+num_processes: 8  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "fp16"  # 2080 Ti 等不支持 bf16 的显卡请使用 fp16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 1000
+
+# Model Configuration
+model:
+  finetune_type: "lora"  # Options: full, lora
+  master_weight_dtype: "fp16"  # 与 mixed_precision 对齐，避免 Half/BFloat16 混用
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: "transformer"
+  target_modules: "default"  # Anima 默认会命中 q/k/v/output_proj + mlp layer1/layer2
+  model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT 权重
+  model_type: "anima"
+  qwen3: "models/qwen_3_06b_base.safetensors"  # Qwen3 文本编码器权重
+  vae: "models/qwen_image_vae.safetensors"  # Qwen-Image VAE 权重
+  t5_tokenizer_path: "tokenizer/t5_old"  # T5 tokenizer 目录
+  sd_scripts_root: "~/sda1/sd-scripts"  # 用于加载参考实现中的 Anima 运行时
+  attn_mode: "torch"  # sdpa 会自动映射为 torch
+  split_attn: true
+  vae_chunk_size: null
+  vae_disable_cache: false
+  discrete_flow_shift: 1.0
+  resume_path: null
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: "grpo"  # Options: grpo, nft, awm
+  advantage_aggregation: "gdpo"  # Options: sum, gdpo
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: "v-based"  # Options: x-based, v-based
+  kl_beta: 0
+  ref_param_device: "cuda"  # Options: cpu, cuda
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.0
+
+  per_device_batch_size: 1
+  group_size: 16
+  global_std: false
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true
+  cpu_offload_checkpointing: false
+  unsloth_offload_checkpointing: false
+
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 1.0
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 28
+  eval_freq: 20
+  seed: 42
+
+# Reward Model Configuration
+rewards:
+  - name: "text_alignment"
+    reward_model: "CLIP"
+    weight: 1.0
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+  - name: "pick_score"
+    reward_model: "PickScore"
+    weight: 0.5
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
