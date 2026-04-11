@@ -3,7 +3,7 @@ launcher: "accelerate"  # Options: accelerate
 config_file: config/accelerate_configs/fsdp2.yaml
 num_processes: 8
 main_process_port: 29500
-mixed_precision: "fp16"  # 2080 Ti 等不支持 bf16 的显卡请使用 fp16
+mixed_precision: "bf16"  # Use fp16 only on GPUs without bf16 support.
 
 # Data Configuration
 data:
@@ -17,15 +17,15 @@ data:
 # Model Configuration
 model:
   finetune_type: "full"  # Options: full, lora
-  master_weight_dtype: "fp16"  # 与 mixed_precision 对齐，避免 Half/BFloat16 混用
+  master_weight_dtype: "bf16"
   target_components: "transformer"
-  target_modules: "default"
-  model_name_or_path: "models/animaOfficial_preview2.safetensors"
+  target_modules: "all"
+  model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT checkpoint.
   model_type: "anima"
   qwen3: "models/qwen_3_06b_base.safetensors"
   vae: "models/qwen_image_vae.safetensors"
   t5_tokenizer_path: "tokenizer/t5_old"
-  sd_scripts_root: "~/sda1/sd-scripts"
+  sd_scripts_root: "~/sd-scripts"
   attn_mode: "torch"
   split_attn: true
   vae_chunk_size: null
@@ -51,6 +51,7 @@ train:
   kl_type: "v-based"  # Options: x-based, v-based
   kl_beta: 0
   ref_param_device: "cuda"
+  latent_storage_dtype: "bf16"
 
   resolution: 384
   num_inference_steps: 10

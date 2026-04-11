@@ -1,9 +1,9 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/accelerate_configs/fsdp2.yaml  # 显存足够时也可切到 deepspeed 配置
+config_file: config/accelerate_configs/fsdp2.yaml
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
-mixed_precision: "fp16"  # 2080 Ti 等不支持 bf16 的显卡请使用 fp16
+mixed_precision: "bf16"  # Use fp16 only on GPUs without bf16 support.
 
 # Data Configuration
 data:
@@ -17,18 +17,18 @@ data:
 # Model Configuration
 model:
   finetune_type: "lora"  # Options: full, lora
-  master_weight_dtype: "fp16"  # 与 mixed_precision 对齐，避免 Half/BFloat16 混用
+  master_weight_dtype: "bf16"
   lora_rank: 64
   lora_alpha: 128
   target_components: "transformer"
-  target_modules: "default"  # Anima 默认会命中 q/k/v/output_proj + mlp layer1/layer2
-  model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT 权重
+  target_modules: "default"  # Matches q/k/v/output_proj and MLP layer1/layer2 by default.
+  model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT checkpoint.
   model_type: "anima"
-  qwen3: "models/qwen_3_06b_base.safetensors"  # Qwen3 文本编码器权重
-  vae: "models/qwen_image_vae.safetensors"  # Qwen-Image VAE 权重
-  t5_tokenizer_path: "tokenizer/t5_old"  # T5 tokenizer 目录
-  sd_scripts_root: "~/sda1/sd-scripts"  # 用于加载参考实现中的 Anima 运行时
-  attn_mode: "torch"  # sdpa 会自动映射为 torch
+  qwen3: "models/qwen_3_06b_base.safetensors"
+  vae: "models/qwen_image_vae.safetensors"
+  t5_tokenizer_path: "tokenizer/t5_old"
+  sd_scripts_root: "~/sd-scripts"
+  attn_mode: "torch"  # "sdpa" is normalized to "torch" for compatibility.
   split_attn: true
   vae_chunk_size: null
   vae_disable_cache: false
@@ -53,6 +53,7 @@ train:
   kl_type: "v-based"  # Options: x-based, v-based
   kl_beta: 0
   ref_param_device: "cuda"  # Options: cpu, cuda
+  latent_storage_dtype: "bf16"
 
   resolution: 512
   num_inference_steps: 10

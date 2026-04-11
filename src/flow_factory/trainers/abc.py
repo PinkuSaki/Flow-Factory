@@ -261,7 +261,7 @@ class BaseTrainer(ABC):
         # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
         for i, name in enumerate(trainable_module_names):
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None:
-                self.adapter.set_component(name, prepared[i])
+                self.adapter.set_component(name, prepared[i], prepared=True)
 
         self.optimizer = prepared[len(trainable_modules)]
         if self.test_dataloader is not None:

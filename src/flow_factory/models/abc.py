@@ -118,6 +118,7 @@ class BaseAdapter(ABC):
         
         # Initialize prepared components cache
         self._components: Dict[str, torch.nn.Module] = {}
+        self._prepared_components: set[str] = set()
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
@@ -194,9 +195,13 @@ class BaseAdapter(ABC):
         """Get the unwrapped model from accelerator."""
         return self.accelerator.unwrap_model(model)
 
-    def set_component(self, name: str, module: torch.nn.Module):
-        """Set a component, storing it in the cache (maybe prepared) and keeping original in pipeline."""
+    def set_component(self, name: str, module: torch.nn.Module, prepared: bool = False):
+        """Set a component and track whether accelerator owns its device placement."""
         self._components[name] = module
+        if prepared:
+            self._prepared_components.add(name)
+        else:
+            self._prepared_components.discard(name)
     
     def get_component(self, name: str) -> torch.nn.Module:
         """Get a component, preferring the prepared version if available."""
@@ -215,7 +220,7 @@ class BaseAdapter(ABC):
         components = [getattr(self.pipeline, name) for name in component_names]
         prepared = accelerator.prepare(*components)
         for name, module in zip(component_names, prepared):
-            self.set_component(name, module)
+            self.set_component(name, module, prepared=True)
         return prepared
 
     # ------------------------------ Text Encoders & Tokenizers ------------------------------
@@ -1798,7 +1803,7 @@ class BaseAdapter(ABC):
         Prepared (FSDP/DeepSpeed wrapped) components are managed by the
         accelerator and should not be manually moved.
         """
-        return name not in self._components
+        return name not in self._prepared_components
 
     def _resolve_component_names(self, components: Optional[Union[str, List[str]]] = None) -> List[str]:
         """

@@ -38,7 +38,21 @@ Based on the fix type, write the fix entry to the appropriate document:
 
 <!-- This section accumulates over time. Append new records at the end using the template above. -->
 
-(No records yet)
+### [Anima BF16 Timestep Dtype Mismatch]
+- **Date**: 2026-04-11
+- **Symptom**: Anima BF16 inference failed inside `t_embedder.linear_1` with `expected mat1 and mat2 to have the same dtype, but got: c10::Half != c10::BFloat16`.
+- **Root Cause**: The Anima adapter derived timestep dtype from stored trajectory latents, which could be downcast to FP16 by `latent_storage_dtype`, while the transformer weights stayed in BF16.
+- **Fix**: Updated `src/flow_factory/models/anima/anima.py` so transformer-facing tensors use the transformer's device and dtype explicitly, and updated Anima example configs to store trajectory latents in BF16.
+- **Lesson**: For rollout-to-train pipelines, model-input dtype must be derived from the active module weights, not from intermediate storage tensors that may use a cheaper archival precision.
+- **Related Constraint**: N/A
+
+### [Cached Components Are Not Always Accelerator-Prepared]
+- **Date**: 2026-04-11
+- **Symptom**: `adapter.on_load(cuda)` did not move LoRA-wrapped transformers to GPU after `load_model(...)`, causing direct inference paths to leave the trainable component on CPU.
+- **Root Cause**: `BaseAdapter` used `_components` both as a cache for replaced modules and as the marker for accelerator-managed modules, so any cached LoRA component was incorrectly skipped by device-loading logic.
+- **Fix**: Updated `src/flow_factory/models/abc.py` and `src/flow_factory/trainers/abc.py` to track accelerator-prepared components separately via `_prepared_components`, and only skip manual device management for components that were actually passed through `accelerator.prepare(...)`.
+- **Lesson**: Module replacement and distributed wrapping are different states; caching a component must not imply that Accelerate owns its device placement.
+- **Related Constraint**: N/A
 
 ## Cross-refs
 

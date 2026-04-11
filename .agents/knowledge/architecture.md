@@ -104,6 +104,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 **Model Adapters** (`models/registry.py`):
 | Key | Class | Task |
 |-----|-------|------|
+| `anima` | `AnimaAdapter` | Text-to-Image |
 | `sd3-5` | `SD3_5Adapter` | Text-to-Image |
 | `flux1` | `Flux1Adapter` | Text-to-Image |
 | `flux1-kontext` | `Flux1KontextAdapter` | Image-to-Image |

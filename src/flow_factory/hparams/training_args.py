@@ -191,6 +191,26 @@ class TrainingArguments(ArgABC):
         default=1e-5,
         metadata={"help": "Initial learning rate."},
     )
+    self_attn_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional Anima self-attention learning rate override."},
+    )
+    cross_attn_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional Anima cross-attention learning rate override."},
+    )
+    mlp_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional Anima MLP learning rate override."},
+    )
+    mod_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional Anima modulation-layer learning rate override."},
+    )
+    llm_adapter_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional Anima LLM adapter learning rate override."},
+    )
     adam_weight_decay: float = field(
         default=1e-4,
         metadata={"help": "Weight decay for AdamW optimizer."},
