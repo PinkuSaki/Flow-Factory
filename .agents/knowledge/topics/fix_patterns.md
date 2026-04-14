@@ -54,6 +54,30 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Module replacement and distributed wrapping are different states; caching a component must not imply that Accelerate owns its device placement.
 - **Related Constraint**: N/A
 
+### [Anima Evaluation Can Legitimately Omit Trajectory Latents]
+- **Date**: 2026-04-11
+- **Symptom**: An Anima GRPO short run crashed during evaluation before training with a `NoneType` failure while stacking `all_latents`.
+- **Root Cause**: `AnimaAdapter.inference()` assumed the latent collector always produced trajectory latents, but evaluation paths may pass `trajectory_indices=None` and intentionally disable latent collection.
+- **Fix**: Updated `src/flow_factory/models/anima/anima.py` so `all_latents` stays `None` when the collector is disabled instead of being unconditionally stacked.
+- **Lesson**: Adapter outputs must preserve optional trajectory fields across both rollout and evaluation paths; assuming rollout-only data in shared code breaks train-eval parity.
+- **Related Constraint**: N/A
+
+### [Loopback Reward Services Must Bypass Environment Proxies]
+- **Date**: 2026-04-11
+- **Symptom**: Local reward service calls were at risk of being routed through global proxy environment variables, causing connection failures or unnecessary indirection.
+- **Root Cause**: The training-side `requests` client and the bridge-side `httpx` / OpenAI client inherited environment proxy settings even for `127.0.0.1` endpoints.
+- **Fix**: Updated `src/flow_factory/rewards/my_reward_remote.py` and `scripts/reward_servers/unifiedreward_flex_bridge.py` to disable environment proxies for loopback targets.
+- **Lesson**: Local control-plane traffic should never depend on external proxy configuration; loopback endpoints need explicit proxy bypass in all HTTP clients.
+- **Related Constraint**: N/A
+
+### [Pairwise Judge Parsing Must Tolerate Verbose or Truncated Winners]
+- **Date**: 2026-04-11
+- **Symptom**: The UnifiedReward-Flex bridge returned `500` errors on long Markdown prompts because the judge sometimes emitted verbose string winners or truncated JSON.
+- **Root Cause**: The bridge expected a narrow winner schema and forwarded unbounded prompt text, which increased the chance of echoed prompts and clipped JSON payloads.
+- **Fix**: Updated `scripts/reward_servers/unifiedreward_flex_bridge.py` to normalize and truncate prompts, increase the completion budget, and parse integer, string, and partially truncated `winner` fields.
+- **Lesson**: LLM-based control outputs need bounded prompts and schema-tolerant parsing; production bridges should handle minor format drift without collapsing the training job.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

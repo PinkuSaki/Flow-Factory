@@ -1,0 +1,112 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/accelerate_configs/fsdp2.yaml
+num_processes: 4  # Keep training resources available for the external shadow reward service.
+main_process_port: 29500
+mixed_precision: "bf16"  # Use fp16 only on GPUs without bf16 support.
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/anime_custom"  # Markdown prompts are stored in train.jsonl / test.jsonl.
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+
+# Model Configuration
+model:
+  finetune_type: "lora"  # Options: full, lora
+  master_weight_dtype: "bf16"
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: "transformer"
+  target_modules: "default"  # Matches q/k/v/output_proj and MLP layer1/layer2 by default.
+  model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT checkpoint.
+  model_type: "anima"
+  qwen3: "models/qwen_3_06b_base.safetensors"
+  vae: "models/qwen_image_vae.safetensors"
+  t5_tokenizer_path: "tokenizer/t5_old"
+  sd_scripts_root: "~/sd-scripts"
+  attn_mode: "flash"  # "sdpa" is normalized to "torch" for compatibility.
+  split_attn: true
+  vae_chunk_size: null
+  vae_disable_cache: false
+  discrete_flow_shift: 1.0
+  resume_path: null
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+
+log:
+  run_name: "anima_anime_custom_shadow_grpo_lora"
+  project: "Flow-Factory"
+  logging_backend: "tensorboard"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"
+  save_freq: 10
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: "grpo"  # Options: grpo, nft, awm
+  advantage_aggregation: "gdpo"  # Options: sum, gdpo
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: "v-based"  # Options: x-based, v-based
+  kl_beta: 0
+  ref_param_device: "cuda"  # Options: cpu, cuda
+  latent_storage_dtype: "bf16"
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.0
+
+  max_epochs: 50
+  per_device_batch_size: 1
+  group_size: 4
+  global_std: false
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 2
+
+  learning_rate: 2.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true
+  cpu_offload_checkpointing: false
+  unsloth_offload_checkpointing: false
+
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 1.0
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 10
+  eval_freq: 10
+  seed: 42
+
+# Reward Model Configuration
+rewards:
+  - name: "aesthetic_shadow"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    weight: 1.0
+    batch_size: 8
+    device: "cpu"
+    dtype: float32
+    server_url: "http://127.0.0.1:18081"
+    timeout: 60.0
+    retry_attempts: 3

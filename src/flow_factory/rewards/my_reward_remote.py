@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+from urllib.parse import urlparse
 from typing import List, Optional, Tuple, Union
 
 import requests
@@ -102,6 +103,15 @@ class RemoteRewardClient:
         self.timeout = timeout
         self.retries = retries
         self._session = requests.Session()
+        if self._should_bypass_env_proxy(server_url):
+            # Local reward servers should never be routed through global HTTP proxies.
+            self._session.trust_env = False
+
+    @staticmethod
+    def _should_bypass_env_proxy(server_url: str) -> bool:
+        """Return True when the target URL points to a loopback endpoint."""
+        hostname = (urlparse(server_url).hostname or "").lower()
+        return hostname in {"127.0.0.1", "localhost", "::1"}
 
     def health_check(self) -> bool:
         """Check server availability."""

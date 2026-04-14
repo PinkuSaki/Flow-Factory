@@ -107,6 +107,10 @@ latest_checkpointed_iteration.txt
 # gitattributes in dataset
 dataset/**/.gitattributes
 
+# Local generated custom datasets
+dataset/anime_custom/
+dataset/anime_custom_single_gpu_eval8/
+
 # Image data
 dataset/**/image/
 dataset/**/image*
@@ -126,7 +130,7 @@ dataset/**/*.avi
 dataset/**/*.mov
 
 # Models
-models/
+#models/
 
 # ====================
 # Archives

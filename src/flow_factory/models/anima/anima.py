@@ -665,7 +665,11 @@ class AnimaAdapter(BaseAdapter):
         return [
             AnimaSample(
                 timesteps=timesteps,
-                all_latents=torch.stack([latent[b] for latent in all_latents], dim=0),
+                all_latents=(
+                    torch.stack([latent[b] for latent in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
                 log_probs=(
                     torch.stack([log_prob[b] for log_prob in all_log_probs], dim=0)
                     if all_log_probs is not None
