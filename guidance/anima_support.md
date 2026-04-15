@@ -117,6 +117,11 @@ Observed LoRA target list:
 - `layer1`
 - `layer2`
 
+Default attachment scope:
+
+- top-level `blocks.*` modules only
+- `llm_adapter.*` is excluded from the default LoRA recipe
+
 ### 2. BF16 inference smoke
 
 Date: April 11, 2026
@@ -167,7 +172,7 @@ Observed results:
 - non-zero gradient norm observed on the first optimization step: `7.4845`
 - optimizer steps completed: `2`
 - tracked LoRA parameter:
-  - `base_model.model.llm_adapter.blocks.0.self_attn.q_proj.lora_B.default.weight`
+  - `base_model.model.blocks.0.self_attn.q_proj.lora_B.default.weight`
 - tracked parameter norm changed from `0.0` to `0.12700527906417847`
 - tracked parameter absolute delta sum: `32.485313415527344`
 

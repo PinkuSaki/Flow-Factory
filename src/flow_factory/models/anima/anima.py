@@ -28,6 +28,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler as DiffusersFlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -48,6 +49,8 @@ from ...utils.trajectory_collector import (
 from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
+
+ANIMA_DEFAULT_LORA_EXCLUDE_PATTERN = r"^llm_adapter(?:\..*)?$"
 
 
 def _resolve_sd_scripts_root(sd_scripts_root: str) -> str:
@@ -203,6 +206,136 @@ class AnimaAdapter(BaseAdapter):
     def default_target_modules(self) -> List[str]:
         """Default LoRA targets matching the reference Anima LoRA recipe."""
         return ["q_proj", "k_proj", "v_proj", "output_proj", "layer1", "layer2"]
+
+    def _resolve_default_lora_exclude_modules(
+        self,
+        target_modules: Union[str, List[str]],
+        component_name: str,
+    ) -> Optional[str]:
+        """Return the PEFT exclusion pattern for the default Anima LoRA recipe.
+
+        The default Anima LoRA recipe should target only the top-level DiT blocks. PEFT
+        list-based matching is suffix-based, so names like ``q_proj`` would also match
+        ``llm_adapter.*.q_proj`` unless that subtree is explicitly excluded.
+
+        Args:
+            target_modules: Raw target module configuration passed to ``apply_lora``.
+            component_name: Component currently receiving LoRA adapters.
+
+        Returns:
+            Regex pattern for ``exclude_modules`` when the default Anima LoRA recipe
+            should exclude ``llm_adapter``. Returns ``None`` for all other cases.
+        """
+        if component_name != "transformer":
+            return None
+
+        raw_modules = [target_modules] if isinstance(target_modules, str) else target_modules
+        default_aliases = {"default", f"{component_name}.default"}
+        requested_default = any(module in default_aliases for module in raw_modules)
+        requested_llm_adapter = any(
+            module not in default_aliases and "llm_adapter" in module for module in raw_modules
+        )
+
+        if requested_default and not requested_llm_adapter:
+            return ANIMA_DEFAULT_LORA_EXCLUDE_PATTERN
+        return None
+
+    def _create_lora_config(
+        self,
+        target_modules: Union[str, List[str]],
+        exclude_modules: Optional[str] = None,
+    ) -> LoraConfig:
+        """Create a LoRA config for the current Anima adapter settings.
+
+        Args:
+            target_modules: PEFT target module spec for the current component.
+            exclude_modules: Optional PEFT exclusion regex.
+
+        Returns:
+            LoRA config initialized from the current model arguments.
+        """
+        return LoraConfig(
+            r=self.model_args.lora_rank,
+            lora_alpha=self.model_args.lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
+            exclude_modules=exclude_modules,
+        )
+
+    def apply_lora(
+        self,
+        target_modules: Union[str, List[str]],
+        components: Union[str, List[str]] = "transformer",
+        overwrite: bool = False,
+    ) -> Union[PeftModel, Dict[str, PeftModel]]:
+        """Apply LoRA adapters while keeping the default Anima recipe off ``llm_adapter``.
+
+        Args:
+            target_modules: Module patterns with optional component prefix.
+            components: Component or components to receive LoRA adapters.
+            overwrite: Whether to replace an existing ``default`` adapter.
+
+        Returns:
+            The wrapped PEFT model, or a mapping when multiple components are updated.
+        """
+        if isinstance(components, str):
+            components = [components]
+
+        component_modules = self._parse_target_modules(target_modules, components)
+        results = {}
+        for comp in components:
+            modules = component_modules.get(comp)
+
+            if modules == "default":
+                modules = self.default_target_modules
+            elif modules == "all":
+                modules = "all"
+            elif not modules:
+                logger.warning(f"No target modules for {comp}, skipping LoRA")
+                continue
+
+            exclude_modules = self._resolve_default_lora_exclude_modules(target_modules, comp)
+            lora_config = self._create_lora_config(modules, exclude_modules=exclude_modules)
+            model_component = self.get_component(comp)
+
+            if isinstance(model_component, PeftModel):
+                has_default = "default" in model_component.peft_config
+                if has_default and not overwrite:
+                    logger.info(
+                        f"Component {comp} already has 'default' adapter. "
+                        "Skipping initialization but enabling gradients."
+                    )
+                    for name, param in model_component.named_parameters():
+                        if any(key in name for key in self.lora_keys):
+                            param.requires_grad = True
+                    results[comp] = model_component
+                    continue
+
+                if has_default and overwrite:
+                    logger.info(f"Overwriting existing 'default' adapter for {comp}")
+                    model_component.delete_adapter("default")
+
+                model_component.add_adapter("default", lora_config)
+            else:
+                model_component = get_peft_model(model_component, lora_config)
+                self.set_component(comp, model_component)
+
+            model_component.set_adapter("default")
+            results[comp] = model_component
+
+            if exclude_modules is None:
+                logger.info(f"Applied LoRA to {comp} with modules: {modules}")
+            else:
+                logger.info(
+                    f"Applied LoRA to {comp} with modules: {modules} "
+                    f"(exclude_modules={exclude_modules})"
+                )
+
+        if not results:
+            logger.warning("No LoRA adapters were applied")
+            return {}
+
+        return next(iter(results.values())) if len(results) == 1 else results
 
     def load_pipeline(self) -> AnimaPipeline:
         """Load the Anima runtime components through sd-scripts helpers."""
