@@ -21,7 +21,7 @@ model:
   lora_rank: 64
   lora_alpha: 128
   target_components: "transformer"
-  target_modules: "default"  # Matches q/k/v/output_proj and MLP layer1/layer2 by default.
+  target_modules: "default"  # Default: top-level DiT q/k/v/output_proj + MLP layer1/layer2; excludes llm_adapter.
   model_name_or_path: "models/animaOfficial_preview2.safetensors"  # Anima DiT checkpoint.
   model_type: "anima"
   qwen3: "models/qwen_3_06b_base.safetensors"
