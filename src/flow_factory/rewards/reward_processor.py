@@ -20,8 +20,9 @@ from __future__ import annotations
 from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
 from collections import defaultdict
 from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import torch
+import torch.distributed as dist
 import numpy as np
 from tqdm import tqdm
 
@@ -89,6 +90,55 @@ class RewardProcessor:
         """Resolve the number of concurrent workers for an async reward model."""
         config = self.reward_configs.get(name)
         return max(1, getattr(config, 'num_workers', 1)) if config else 1
+
+    def _resolve_remote_dispatch_mode(
+        self,
+        name: str,
+        model: BaseRewardModel,
+    ) -> Optional[str]:
+        """Resolve distributed dispatch mode for a remote pointwise reward."""
+        config = self.reward_configs.get(name)
+        if config is None:
+            return None
+
+        if not getattr(model, 'is_remote_reward', False):
+            return None
+
+        mode = getattr(config, 'remote_dispatch_mode', 'main_process')
+        if mode in {'per_rank', 'local'}:
+            return None
+        if mode != 'main_process':
+            raise ValueError(
+                f"Invalid remote_dispatch_mode for reward '{name}': {mode!r}. "
+                "Supported values are 'main_process' and 'per_rank'."
+            )
+
+        return mode
+
+    def _resolve_remote_max_concurrent_requests(
+        self,
+        name: str,
+        model: BaseRewardModel,
+    ) -> int:
+        """Resolve main-process HTTP request concurrency for a remote reward."""
+        config = self.reward_configs.get(name)
+        value = getattr(config, 'remote_max_concurrent_requests', 1) if config else 1
+        value = int(value)
+        if value <= 0:
+            raise ValueError(
+                f"Invalid remote_max_concurrent_requests for reward '{name}': {value}. "
+                "It must be a positive integer."
+            )
+        return value
+
+    def _resolve_remote_offload_after_compute(
+        self,
+        name: str,
+        model: BaseRewardModel,
+    ) -> bool:
+        """Resolve whether to offload a remote server after this reward finishes."""
+        config = self.reward_configs.get(name)
+        return bool(getattr(config, 'remote_offload_after_compute', False)) if config else False
 
     def _resolve_batch_size(self, name: str, model: BaseRewardModel) -> int:
         """
@@ -159,6 +209,122 @@ class RewardProcessor:
             output.rewards if hasattr(output, 'rewards') else output,
             device='cpu', dtype=torch.float32,
         )
+
+    def _gather_sample_counts(self, local_count: int) -> list[int]:
+        """Gather per-rank sample counts for distributed reward scatter."""
+        if self.accelerator.num_processes <= 1:
+            return [local_count]
+
+        count = torch.tensor(
+            [local_count],
+            device=self.accelerator.device,
+            dtype=torch.long,
+        )
+        gathered = self.accelerator.gather(count)
+        return [int(value) for value in gathered.cpu().tolist()]
+
+    def _broadcast_main_process_object(self, value: Any) -> Any:
+        """Broadcast a Python object from global rank 0 to all ranks."""
+        if self.accelerator.num_processes <= 1:
+            return value
+        objects = [value if self.accelerator.is_main_process else None]
+        dist.broadcast_object_list(objects, src=0)
+        return objects[0]
+
+    def _signal_remote_lifecycle(
+        self,
+        model: PointwiseRewardModel,
+        action: Literal['load', 'offload'],
+    ) -> None:
+        """Send a remote model lifecycle signal when the model supports it."""
+        method = getattr(model, f'{action}_remote', None)
+        if method is not None:
+            method()
+
+    def _compute_main_process_remote_pointwise_reward(
+        self,
+        name: str,
+        model: PointwiseRewardModel,
+        samples: List[BaseSample],
+        epoch: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Compute a remote pointwise reward from rank 0 with bounded threads."""
+        device = self.accelerator.device
+        rank = self.accelerator.process_index
+
+        self.accelerator.wait_for_everyone()
+        gathered = gather_samples(
+            accelerator=self.accelerator,
+            samples=samples,
+            field_names=list(model.required_fields),
+            device=torch.device('cpu'),
+        )
+        sample_counts = self._gather_sample_counts(len(samples))
+        local_start = sum(sample_counts[:rank])
+        local_end = local_start + sample_counts[rank]
+
+        num_gathered = len(gathered)
+        all_rewards = torch.zeros(num_gathered, dtype=torch.float32, device=device)
+        batch_size = self._resolve_batch_size(name, model)
+        batch_starts = list(range(0, num_gathered, batch_size))
+        max_workers = self._resolve_remote_max_concurrent_requests(name, model)
+        should_offload = self._resolve_remote_offload_after_compute(name, model)
+        error_message = None
+
+        if self.accelerator.is_main_process:
+            try:
+                if should_offload:
+                    self._signal_remote_lifecycle(model, 'load')
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_span = {}
+                    for start in batch_starts:
+                        end = min(start + batch_size, num_gathered)
+                        future = executor.submit(
+                            self._compute_pointwise_batch,
+                            name,
+                            model,
+                            gathered[start:end],
+                        )
+                        future_to_span[future] = (start, end)
+
+                    desc = (
+                        f'Epoch {epoch} Remote Pointwise Rewards: {name}'
+                        if epoch is not None
+                        else f'Remote Pointwise Rewards: {name}'
+                    )
+                    with tqdm(
+                        total=len(future_to_span),
+                        desc=desc,
+                        disable=not self.show_progress_bar,
+                    ) as pbar:
+                        for future in as_completed(future_to_span):
+                            start, end = future_to_span[future]
+                            reward_tensor = future.result().to(device)
+                            all_rewards[start:end] = reward_tensor
+                            pbar.update(1)
+            except Exception as exc:  # noqa: BLE001
+                error_message = f"Remote reward '{name}' failed on main process: {exc}"
+            finally:
+                if should_offload:
+                    try:
+                        self._signal_remote_lifecycle(model, 'offload')
+                    except Exception as exc:  # noqa: BLE001
+                        offload_message = (
+                            f"Remote reward '{name}' offload signal failed: {exc}"
+                        )
+                        error_message = (
+                            offload_message
+                            if error_message is None
+                            else f"{error_message}; {offload_message}"
+                        )
+
+        error_message = self._broadcast_main_process_object(error_message)
+        if error_message is not None:
+            raise RuntimeError(error_message)
+
+        all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
+        return all_rewards[local_start:local_end].cpu()
 
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]
@@ -232,6 +398,16 @@ class RewardProcessor:
         results: Dict[str, torch.Tensor] = {}
         
         for name, model in models.items():
+            dispatch_mode = self._resolve_remote_dispatch_mode(name, model)
+            if dispatch_mode == 'main_process':
+                results[name] = self._compute_main_process_remote_pointwise_reward(
+                    name=name,
+                    model=model,
+                    samples=samples,
+                    epoch=epoch,
+                )
+                continue
+
             rewards = []
             batch_size = self._resolve_batch_size(name, model)
 
@@ -561,6 +737,14 @@ class RewardBuffer:
         self._async_groupwise = {n: m for n, m in self.rp._groupwise_models.items() if self.rp._is_async_reward(n)}
         self._sync_groupwise  = {n: m for n, m in self.rp._groupwise_models.items() if not self.rp._is_async_reward(n)}
         self._has_async = bool(self._async_pointwise or self._async_groupwise)
+
+        for name, model in self._async_pointwise.items():
+            if self.rp._resolve_remote_dispatch_mode(name, model) == 'main_process':
+                raise ValueError(
+                    f"Reward '{name}' cannot use both async_reward=True and "
+                    "remote_dispatch_mode='main_process'. Disable async_reward for "
+                    "distributed remote dispatch."
+                )
 
         # Pre-create one CUDA stream per unique device among async models
         # (used inside _execute_task for CUDA-based reward models).

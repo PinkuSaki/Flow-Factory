@@ -23,9 +23,12 @@ Enables using reward models in isolated environments with different dependencies
 Usage:
     rewards:
       - name: "my_reward"
-        reward_model: "flow_factory.rewards.remote.RemotePointwiseRewardModel"
+        reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
         server_url: "http://localhost:8000"
         batch_size: 16
+        remote_dispatch_mode: "main_process"
+        remote_max_concurrent_requests: 1
+        remote_offload_after_compute: true
 """
 
 from __future__ import annotations
@@ -102,10 +105,7 @@ class RemoteRewardClient:
         self.url = server_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
-        self._session = requests.Session()
-        if self._should_bypass_env_proxy(server_url):
-            # Local reward servers should never be routed through global HTTP proxies.
-            self._session.trust_env = False
+        self._bypass_env_proxy = self._should_bypass_env_proxy(server_url)
 
     @staticmethod
     def _should_bypass_env_proxy(server_url: str) -> bool:
@@ -113,14 +113,56 @@ class RemoteRewardClient:
         hostname = (urlparse(server_url).hostname or "").lower()
         return hostname in {"127.0.0.1", "localhost", "::1"}
 
+    def _make_session(self) -> requests.Session:
+        """Create a request session for one worker thread."""
+        session = requests.Session()
+        if self._bypass_env_proxy:
+            # Local reward servers should never be routed through global HTTP proxies.
+            session.trust_env = False
+        return session
+
     def health_check(self) -> bool:
         """Check server availability."""
         try:
-            r = self._session.get(f"{self.url}/health", timeout=5.0)
-            return r.ok
+            with self._make_session() as session:
+                r = session.get(f"{self.url}/health", timeout=5.0)
+                return r.ok
         except Exception as e:
             logger.warning(f"Health check failed: {e}")
             return False
+
+    def _post_control(self, endpoint: str) -> bool:
+        """Send a lifecycle control request to the reward server."""
+        for attempt in range(self.retries):
+            try:
+                with self._make_session() as session:
+                    r = session.post(f"{self.url}/{endpoint}", timeout=self.timeout)
+                if r.status_code == 404:
+                    logger.warning(
+                        "Reward server at %s does not support /%s.",
+                        self.url,
+                        endpoint,
+                    )
+                    return False
+                r.raise_for_status()
+                data = r.json() if r.content else {}
+                if data.get("error"):
+                    raise RuntimeError(f"Server error: {data['error']}")
+                return True
+            except requests.RequestException as e:
+                if attempt == self.retries - 1:
+                    raise RuntimeError(f"Failed to call /{endpoint} on {self.url}: {e}")
+                logger.warning(f"Control attempt {attempt + 1} failed, retrying...")
+
+        raise RuntimeError("Unreachable")
+
+    def load_model(self) -> bool:
+        """Ask the reward server to move its model to the inference device."""
+        return self._post_control("load")
+
+    def offload_model(self) -> bool:
+        """Ask the reward server to move its model back to CPU."""
+        return self._post_control("offload")
 
     def compute(
         self,
@@ -137,9 +179,10 @@ class RemoteRewardClient:
 
         for attempt in range(self.retries):
             try:
-                r = self._session.post(
-                    f"{self.url}/compute", json=payload, timeout=self.timeout
-                )
+                with self._make_session() as session:
+                    r = session.post(
+                        f"{self.url}/compute", json=payload, timeout=self.timeout
+                    )
                 r.raise_for_status()
                 data = r.json()
                 if data.get("error"):
@@ -162,15 +205,19 @@ class RemotePointwiseRewardModel(PointwiseRewardModel):
     Config Example:
         rewards:
           - name: "remote_aesthetic"
-            reward_model: "flow_factory.rewards.remote.RemotePointwiseRewardModel"
+            reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
             server_url: "http://localhost:8000"
             batch_size: 16
             timeout: 60.0        # optional
             retry_attempts: 3    # optional
+            remote_dispatch_mode: "main_process"
+            remote_max_concurrent_requests: 1
+            remote_offload_after_compute: true
     """
 
     required_fields: Tuple[str, ...] = ("prompt", "image") # Corresponds to the expected input kwargs
     use_tensor_inputs: bool = False
+    is_remote_reward: bool = True
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -188,6 +235,14 @@ class RemotePointwiseRewardModel(PointwiseRewardModel):
         if not self.client.health_check():
             raise RuntimeError(f"Cannot connect to reward server at {server_url}")
         logger.info(f"Connected to reward server at {server_url}")
+
+    def load_remote(self) -> bool:
+        """Signal the remote server to load the reward model onto its device."""
+        return self.client.load_model()
+
+    def offload_remote(self) -> bool:
+        """Signal the remote server to offload the reward model to CPU."""
+        return self.client.offload_model()
 
     @torch.no_grad()
     def __call__(
