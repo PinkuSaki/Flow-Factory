@@ -50,6 +50,7 @@ dependencies = [
     "pydantic>=2.8.0",
     "pyyaml>=6.0",
     "requests>=2.31.0",
+    "safetensors>=0.4.5",
     "tqdm",
 ]
 
@@ -73,8 +74,12 @@ nvidia = [
     "nvidia-ml-py",
 ]
 
+reward-servers = [
+    "timm>=1.0.0",
+]
+
 all = [
-    "flow-factory[deepspeed,quantization]",
+    "flow-factory[deepspeed,quantization,reward-servers]",
 ]
 
 [project.scripts]

@@ -12,128 +12,79 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serve Aesthetic Shadow as a simple HTTP reward service.
+"""Serve WD EVA02 prompt-hash reference similarity from a prebuilt cache.
 
 The server exposes:
-    - ``GET /health``  -> ``{"status": "ok"}``
-    - ``POST /load``   -> move the model to the inference device
-    - ``POST /offload`` -> move the model back to CPU
+    - ``GET /health``  -> ``{"status": "ok", "reference_count": ...}``
+    - ``POST /load``   -> move the WD model to the inference device
+    - ``POST /offload`` -> move the WD model back to CPU
     - ``POST /compute`` -> ``{"rewards": [...]}``
 
-The request schema matches ``flow_factory.rewards.my_reward_remote``.
+Reference embeddings must be built before training with
+``build_wd_prompt_hash_cache.py``. This training-time server only loads the
+cache, hashes incoming prompts, encodes generated images, and returns cosine
+similarity rewards.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import importlib.machinery
 import json
 import logging
-import sys
 import threading
-import types
-from contextlib import nullcontext
-from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from PIL import Image
 
-
-def _install_torchvision_stub() -> None:
-    """Install a tiny torchvision stub for environments with broken torchvision builds."""
-
-    class InterpolationMode(Enum):
-        """Minimal enum required by transformers image utilities."""
-
-        NEAREST = 0
-        NEAREST_EXACT = 0
-        BILINEAR = 2
-        BICUBIC = 3
-        BOX = 4
-        HAMMING = 5
-        LANCZOS = 1
-
-    torchvision_module = types.ModuleType("torchvision")
-    torchvision_module.__path__ = []
-    torchvision_module.__spec__ = importlib.machinery.ModuleSpec(
-        name="torchvision",
-        loader=None,
-        is_package=True,
-    )
-
-    transforms_module = types.ModuleType("torchvision.transforms")
-    transforms_module.InterpolationMode = InterpolationMode
-    transforms_module.__spec__ = importlib.machinery.ModuleSpec(
-        name="torchvision.transforms",
-        loader=None,
-        is_package=False,
-    )
-
-    io_module = types.ModuleType("torchvision.io")
-    io_module.__spec__ = importlib.machinery.ModuleSpec(
-        name="torchvision.io",
-        loader=None,
-        is_package=False,
-    )
-
-    torchvision_module.transforms = transforms_module
-    torchvision_module.io = io_module
-
-    sys.modules["torchvision"] = torchvision_module
-    sys.modules["torchvision.transforms"] = transforms_module
-    sys.modules["torchvision.io"] = io_module
+from wd_prompt_hash_common import (
+    WDEVA02EmbeddingModel,
+    load_reference_cache,
+    prompt_sha256,
+)
 
 
-try:
-    import torchvision  # noqa: F401
-except Exception:  # noqa: BLE001
-    _install_torchvision_stub()
-
-from transformers import ViTForImageClassification, ViTImageProcessor
-
-
-LOGGER = logging.getLogger("shadow_server")
+LOGGER = logging.getLogger("wd_prompt_hash_server")
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
-    parser.add_argument("--port", type=int, default=18081, help="Port to bind.")
+    parser.add_argument("--port", type=int, default=18082, help="Port to bind.")
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("/root/reward_models/aesthetic-shadow-v2-backup"),
-        help="Path to the local Aesthetic Shadow checkpoint.",
+        default=Path("../models/wd-eva02-large-tagger-v3"),
+        help="Path to the local WD EVA02 tagger checkpoint directory.",
+    )
+    parser.add_argument(
+        "--cache-path",
+        type=Path,
+        required=True,
+        help="Prebuilt prompt-hash reference embedding cache.",
     )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Torch device for model inference.",
+        help="Torch device for generated image embedding inference.",
     )
     parser.add_argument(
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
         default="bfloat16" if torch.cuda.is_available() else "float32",
-        help="Torch dtype for model inference.",
-    )
-    parser.add_argument(
-        "--score-type",
-        choices=("prob_hq", "logit_margin"),
-        default="prob_hq",
-        help="Reward scoring rule.",
+        help="Torch dtype for CUDA inference. CPU inference always uses float32.",
     )
     parser.add_argument(
         "--max-batch-size",
         type=int,
         default=16,
-        help="Maximum batch size per forward pass.",
+        help="Maximum batch size per model forward pass.",
     )
     parser.add_argument(
         "--log-level",
@@ -154,16 +105,14 @@ def _resolve_media_payload(
     image_payload: Optional[list[str]],
     video_payload: Optional[list[list[str]]],
 ) -> list[Image.Image]:
-    """Resolve image or video payloads into a list of images."""
-    images: list[Image.Image] = []
-
+    """Resolve image or video payloads into a list of generated images."""
     if image_payload:
-        images.extend(_decode_base64_image(item) for item in image_payload)
-        return images
+        return [_decode_base64_image(item) for item in image_payload]
 
     if not video_payload:
-        return images
+        return []
 
+    images: list[Image.Image] = []
     for frames in video_payload:
         if not frames:
             raise ValueError("Encountered an empty video payload.")
@@ -171,66 +120,61 @@ def _resolve_media_payload(
     return images
 
 
-class AestheticShadowService:
-    """Wrapper around the Aesthetic Shadow model."""
+class WDEVA02PromptHashService:
+    """Compute generated-reference similarity rewards with prompt-hash lookup."""
 
     def __init__(
         self,
         model_path: Path,
+        cache_path: Path,
         device: str,
         dtype: str,
-        score_type: str,
         max_batch_size: int,
     ) -> None:
-        self.model_path = model_path
-        self.device = torch.device(device)
-        self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
-        self.score_type = score_type
-        self.max_batch_size = max_batch_size
+        self.cache_path = cache_path
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
 
-        self.processor = ViTImageProcessor.from_pretrained(str(model_path))
-        self.model = ViTForImageClassification.from_pretrained(
-            str(model_path),
-            torch_dtype=self.dtype,
+        self.reference_embeddings = load_reference_cache(cache_path)
+        self.encoder = WDEVA02EmbeddingModel(
+            model_path=model_path,
+            device=device,
+            dtype=dtype,
+            max_batch_size=max_batch_size,
         )
-        self.model.eval()
 
-        label_to_id = getattr(self.model.config, "label2id", {}) or {}
-        self.hq_index = int(label_to_id.get("hq", 0))
-        self.lq_index = int(label_to_id.get("lq", 1 if self.hq_index == 0 else 0))
+        LOGGER.info(
+            "Loaded %s WD reference embeddings from %s",
+            len(self.reference_embeddings),
+            cache_path,
+        )
 
     def ensure_on_device(self) -> None:
-        """Move the Aesthetic Shadow model to its inference device."""
+        """Move the WD model to its inference device."""
         with self._condition:
             self._ensure_on_device_locked()
 
     def _ensure_on_device_locked(self) -> None:
-        """Move the model to its inference device while holding the condition."""
+        """Move the WD model to its inference device while holding the condition."""
         if self._loaded_on_device:
             return
-        self.model.to(device=self.device, dtype=self.dtype)
-        self.model.eval()
+        self.encoder.ensure_on_device()
         self._loaded_on_device = True
 
     def offload_to_cpu(self) -> None:
-        """Move the Aesthetic Shadow model to CPU and release CUDA cache."""
+        """Move the WD model to CPU after in-flight compute requests finish."""
         with self._condition:
             while self._active_compute_count > 0:
                 self._condition.wait()
             self._offload_to_cpu_locked()
 
     def _offload_to_cpu_locked(self) -> None:
-        """Move the model to CPU while holding the condition."""
+        """Move the WD model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
-        self.model.to("cpu")
-        self.model.eval()
+        self.encoder.offload_to_cpu()
         self._loaded_on_device = False
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
 
     def _enter_compute(self) -> None:
         """Mark a compute request active and ensure the model is loaded."""
@@ -244,53 +188,52 @@ class AestheticShadowService:
             self._active_compute_count -= 1
             self._condition.notify_all()
 
-    def _get_autocast_context(self):
-        """Create a fresh autocast context for one forward pass."""
-        if self.device.type == "cuda" and self.dtype != torch.float32:
-            return torch.autocast(device_type=self.device.type, dtype=self.dtype)
-        return nullcontext()
-
     def compute_rewards(
         self,
+        prompts: list[str],
         image_payload: Optional[list[str]],
         video_payload: Optional[list[list[str]]],
     ) -> list[float]:
-        """Compute rewards for a batch of images or videos."""
-        images = _resolve_media_payload(image_payload, video_payload)
+        """Compute cosine similarity rewards for generated images."""
+        images = _resolve_media_payload(image_payload=image_payload, video_payload=video_payload)
         if not images:
             raise ValueError("At least one image or video input is required.")
+        if len(prompts) != len(images):
+            raise ValueError(
+                f"Prompt/image length mismatch: prompts={len(prompts)} images={len(images)}"
+            )
 
-        rewards: list[float] = []
+        prompt_hashes = [prompt_sha256(prompt) for prompt in prompts]
+        missing_hashes = [
+            prompt_hash
+            for prompt_hash in prompt_hashes
+            if prompt_hash not in self.reference_embeddings
+        ]
+        if missing_hashes:
+            raise KeyError(
+                f"Missing reference embeddings for {len(missing_hashes)} prompt hash(es), "
+                f"first missing hash: {missing_hashes[0]}"
+            )
 
         self._enter_compute()
         try:
-            with torch.inference_mode():
-                for start in range(0, len(images), self.max_batch_size):
-                    batch_images = images[start : start + self.max_batch_size]
-                    inputs = self.processor(images=batch_images, return_tensors="pt")
-                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
-
-                    with self._get_autocast_context():
-                        logits = self.model(**inputs).logits
-
-                    if self.score_type == "logit_margin":
-                        batch_scores = logits[:, self.hq_index] - logits[:, self.lq_index]
-                    else:
-                        batch_scores = logits.softmax(dim=-1)[:, self.hq_index]
-
-                    rewards.extend(batch_scores.detach().cpu().float().tolist())
+            generated_embeddings = self.encoder.encode_images(images)
         finally:
             self._exit_compute()
 
-        return rewards
+        reference_embeddings = torch.stack(
+            [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+        )
+        rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
+        return rewards.float().tolist()
 
 
 class RewardRequestHandler(BaseHTTPRequestHandler):
-    """HTTP request handler bound to a reward service instance."""
+    """HTTP request handler bound to the WD prompt-hash reward service."""
 
-    service: AestheticShadowService
+    service: WDEVA02PromptHashService
 
-    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         """Write a JSON response."""
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -302,7 +245,13 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         """Handle GET requests."""
         if self.path == "/health":
-            self._send_json({"status": "ok"})
+            self._send_json(
+                {
+                    "status": "ok",
+                    "reference_count": len(self.service.reference_embeddings),
+                    "cache_path": str(self.service.cache_path),
+                }
+            )
             return
         self._send_json(
             {"error": f"Unsupported path: {self.path}"},
@@ -316,7 +265,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                 self.service.ensure_on_device()
                 self._send_json({"status": "loaded"})
             except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed to load shadow model.")
+                LOGGER.exception("Failed to load WD prompt-hash model.")
                 self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
@@ -325,7 +274,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                 self.service.offload_to_cpu()
                 self._send_json({"status": "offloaded"})
             except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed to offload shadow model.")
+                LOGGER.exception("Failed to offload WD prompt-hash model.")
                 self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
@@ -341,15 +290,16 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             raw_body = self.rfile.read(content_length)
             payload = json.loads(raw_body.decode("utf-8"))
             rewards = self.service.compute_rewards(
+                prompts=payload.get("prompt") or [],
                 image_payload=payload.get("image"),
                 video_payload=payload.get("video"),
             )
             self._send_json({"rewards": rewards})
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to compute shadow rewards.")
+            LOGGER.exception("Failed to compute WD prompt-hash rewards.")
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
-    def log_message(self, fmt: str, *args: Any) -> None:
+    def log_message(self, fmt: str, *args) -> None:
         """Redirect HTTP logs through the standard logger."""
         LOGGER.info("%s - %s", self.address_string(), fmt % args)
 
@@ -359,17 +309,17 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
-    RewardRequestHandler.service = AestheticShadowService(
+    RewardRequestHandler.service = WDEVA02PromptHashService(
         model_path=args.model_path,
+        cache_path=args.cache_path,
         device=args.device,
         dtype=args.dtype,
-        score_type=args.score_type,
         max_batch_size=args.max_batch_size,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)
     LOGGER.info(
-        "Starting Aesthetic Shadow reward server on http://%s:%s using %s",
+        "Starting WD prompt-hash reward server on http://%s:%s using %s",
         args.host,
         args.port,
         args.model_path,
@@ -377,7 +327,7 @@ def main() -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        LOGGER.info("Stopping Aesthetic Shadow reward server.")
+        LOGGER.info("Stopping WD prompt-hash reward server.")
     finally:
         server.server_close()
 
