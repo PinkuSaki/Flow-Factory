@@ -128,12 +128,13 @@ class GRPOTrainer(BaseTrainer):
                 key: self.accelerator.gather(value).cpu().numpy()
                 for key, value in rewards.items()
             }
+            gathered_samples = self._gather_eval_samples_for_logging(all_samples)
             
             # Log statistics
             if self.accelerator.is_main_process:
                 _log_data = {f'eval/reward_{key}_mean': np.mean(value) for key, value in gathered_rewards.items()}
                 _log_data.update({f'eval/reward_{key}_std': np.std(value) for key, value in gathered_rewards.items()})
-                _log_data['eval_samples'] = all_samples
+                _log_data['eval_samples'] = gathered_samples
                 self.log_data(_log_data, step=self.step)
             self.accelerator.wait_for_everyone()
 

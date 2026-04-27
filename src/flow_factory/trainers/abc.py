@@ -15,40 +15,50 @@
 # src/flow_factory/trainers/abc.py
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal
+from dataclasses import dataclass, fields
 from functools import partial
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from dataclasses import dataclass
-from PIL import Image
-from diffusers.utils.outputs import BaseOutput
+import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils.operations import gather_object
+from diffusers.utils.outputs import BaseOutput
+from PIL import Image
+from torch.utils.data import DataLoader
 
-from ..hparams import *
-from ..models.abc import BaseAdapter
-from ..data_utils.loader import get_dataloader
-from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
-from ..logger import load_logger, LogFormatter
+from ..data_utils.loader import get_dataloader
+from ..hparams import *
+from ..logger import LogFormatter, load_logger
+from ..models.abc import BaseAdapter
+from ..rewards import (
+    BaseRewardModel,
+    MultiRewardLoader,
+    RewardBuffer,
+    RewardProcessor,
+    load_reward_model,
+)
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
+
 class BaseTrainer(ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
     """
+
     def __init__(
-            self,
-            accelerator: Accelerator,
-            config : Arguments,
-            adapter : BaseAdapter,
-        ):
+        self,
+        accelerator: Accelerator,
+        config: Arguments,
+        adapter: BaseAdapter,
+    ):
         self.accelerator = accelerator
         self.config = config
         self.log_args = config.log_args
@@ -58,7 +68,9 @@ class BaseTrainer(ABC):
         self.eval_args = config.eval_args
 
         self.reward_args = config.reward_args
-        self.eval_reward_args = config.eval_reward_args or config.reward_args # If `eval_reward_args` is not given, use `reward_args`
+        self.eval_reward_args = (
+            config.eval_reward_args or config.reward_args
+        )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
         self.epoch = 0
@@ -72,7 +84,7 @@ class BaseTrainer(ABC):
         self.autocast = partial(
             torch.autocast,
             device_type=accelerator.device.type,
-            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
+            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16,
         )
 
         if self.accelerator.is_local_main_process:
@@ -94,19 +106,72 @@ class BaseTrainer(ABC):
         """Log data using the initialized logger."""
         if self.logger is not None:
             self.logger.log_data(data, step=step)
-        
+
         # Print summary to console
         if self.accelerator.is_local_main_process:
-            metrics = {k: v for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items()) if v is not None}
+            metrics = {
+                k: v
+                for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items())
+                if v is not None
+            }
             if metrics:
                 parts = [f"[Step {step:04d} | Epoch {self.epoch:03d}]"]
                 parts.extend(
-                    f"{k}={int(v)}" if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
-                    else f"{k}={v:.4f}"
+                    (
+                        f"{k}={int(v)}"
+                        if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+                        else f"{k}={v:.4f}"
+                    )
                     for k, v in metrics.items()
                 )
                 logger.info(" ".join(parts))
-    
+
+    def _move_eval_log_value_to_cpu(self, value: Any) -> Any:
+        """Move nested tensor values to CPU before object-gather logging."""
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: self._move_eval_log_value_to_cpu(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._move_eval_log_value_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._move_eval_log_value_to_cpu(v) for v in value)
+        return value
+
+    def _build_eval_log_sample(self, sample: BaseSample) -> BaseSample:
+        """Build a lightweight sample containing only logger-visible fields."""
+        sample_cls = sample.__class__
+        sample_field_names = {f.name for f in fields(sample_cls)}
+        keep_fields = [
+            "height",
+            "width",
+            "image",
+            "video",
+            "prompt",
+            "condition_images",
+            "condition_videos",
+        ]
+        kwargs = {
+            name: self._move_eval_log_value_to_cpu(getattr(sample, name))
+            for name in keep_fields
+            if name in sample_field_names and hasattr(sample, name)
+        }
+
+        rewards = sample.extra_kwargs.get("rewards")
+        if rewards is not None:
+            kwargs["extra_kwargs"] = {
+                "rewards": self._move_eval_log_value_to_cpu(rewards),
+            }
+
+        return sample_cls(**kwargs)
+
+    def _gather_eval_samples_for_logging(self, samples: List[BaseSample]) -> List[BaseSample]:
+        """Gather lightweight eval samples from all ranks for main-process logging."""
+        log_samples = [self._build_eval_log_sample(sample) for sample in samples]
+        if self.accelerator.num_processes <= 1:
+            return log_samples
+        return gather_object(log_samples)
+
     def _init_logging_backend(self):
         """Initialize logging backend if specified."""
         if self.accelerator.is_main_process:
@@ -132,15 +197,15 @@ class BaseTrainer(ABC):
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
-        train_reward_configs = self.reward_loader.get_reward_configs('train')
-        eval_reward_configs = self.reward_loader.get_reward_configs('eval')
+        train_reward_configs = self.reward_loader.get_reward_configs("train")
+        eval_reward_configs = self.reward_loader.get_reward_configs("eval")
         # Initialize reward processor
         group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
         self.reward_processor = RewardProcessor(
             accelerator=self.accelerator,
             reward_models=self.reward_models,
             reward_configs=train_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding,
+            tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
@@ -148,27 +213,26 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             reward_models=self.eval_reward_models,
             reward_configs=eval_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
+            tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
         # Initialize reward buffers
         self.reward_buffer = RewardBuffer(
-            self.reward_processor, self.training_args.group_size,
+            self.reward_processor,
+            self.training_args.group_size,
         )
         self.eval_reward_buffer = RewardBuffer(
-            self.eval_reward_processor, self.training_args.group_size,
+            self.eval_reward_processor,
+            self.training_args.group_size,
         )
 
         # Initialize advantage processor
         self.advantage_processor = AdvantageProcessor(
             accelerator=self.accelerator,
-            reward_weights={
-                name: cfg.weight
-                for name, cfg in train_reward_configs.items()
-            },
+            reward_weights={name: cfg.weight for name, cfg in train_reward_configs.items()},
             group_size=self.training_args.group_size,
-            global_std=getattr(self.training_args, 'global_std', True),
+            global_std=getattr(self.training_args, "global_std", True),
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
         )
@@ -178,8 +242,7 @@ class BaseTrainer(ABC):
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
         self.adapter.on_load_components(
-            components=self.adapter.preprocessing_modules,
-            device=self.accelerator.device
+            components=self.adapter.preprocessing_modules, device=self.accelerator.device
         )
         dataloader, test_dataloader = get_dataloader(
             config=self.config,
@@ -194,7 +257,7 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
         return dataloader, test_dataloader
-    
+
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
         optimizer_params = self.adapter.get_optimizer_param_groups()
@@ -210,27 +273,57 @@ class BaseTrainer(ABC):
     def _load_inference_components(self, trainable_module_names: List[str]):
         """
         Load non-trainable components needed at runtime to the accelerator device.
-        
+
         Trainable modules are already on-device via `accelerator.prepare()`.
         This loads the remaining modules required for inference and,
         when preprocessing is disabled, also loads encoding components
         that would otherwise stay offloaded.
         """
         prepared_names = set(trainable_module_names)
-        
+
         modules_to_load = list(self.adapter.inference_modules)
-        
+
         if not self.config.data_args.enable_preprocess:
             modules_to_load.extend(self.adapter.preprocessing_modules)
-        
+
         # Resolve group names → concrete names, then deduplicate & exclude prepared
         resolved = self.adapter._resolve_component_names(modules_to_load)
         resolved = [m for m in resolved if m not in prepared_names]
-        
+
         if resolved:
             self.adapter.on_load_components(
                 components=resolved,
                 device=self.accelerator.device,
+            )
+
+    def _configure_deepspeed_prepare_batch_size(self) -> None:
+        """Set the DeepSpeed micro batch size when the dataloader is prepared manually."""
+        ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if ds_plugin is None:
+            return
+
+        micro_batch_size = int(self.training_args.per_device_batch_size)
+        ds_config = ds_plugin.deepspeed_config
+        configured = ds_config.get("train_micro_batch_size_per_gpu", "auto")
+
+        if configured in (None, "auto"):
+            ds_config["train_micro_batch_size_per_gpu"] = micro_batch_size
+            logger.info(
+                "Set DeepSpeed train_micro_batch_size_per_gpu to "
+                "per_device_batch_size(%s) because Flow-Factory keeps the "
+                "training dataloader outside accelerator.prepare().",
+                micro_batch_size,
+            )
+            return
+
+        configured_value = int(configured)
+        if configured_value != micro_batch_size:
+            raise ValueError(
+                "DeepSpeed train_micro_batch_size_per_gpu must match "
+                "per_device_batch_size because Flow-Factory keeps the training "
+                "dataloader outside accelerator.prepare(). Got "
+                f"train_micro_batch_size_per_gpu({configured_value}) and "
+                f"per_device_batch_size({micro_batch_size})."
             )
 
     def _initialization(self):
@@ -248,8 +341,8 @@ class BaseTrainer(ABC):
         # Dynamically get all trainable modules from target_module_map
         trainable_module_names = list(self.adapter.target_module_map.keys())
         trainable_modules = [
-            getattr(self.adapter, name) 
-            for name in trainable_module_names 
+            getattr(self.adapter, name)
+            for name in trainable_module_names
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
         ]
         # Prepare trainable modules + optimizer + test_dataloader
@@ -257,6 +350,7 @@ class BaseTrainer(ABC):
         if self.test_dataloader is not None:
             to_prepare.append(self.test_dataloader)
 
+        self._configure_deepspeed_prepare_batch_size()
         prepared = self.accelerator.prepare(*to_prepare)
         # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
         for i, name in enumerate(trainable_module_names):
@@ -269,14 +363,14 @@ class BaseTrainer(ABC):
 
         # Load inference modules, excluding already-prepared ones
         self._load_inference_components(trainable_module_names)
-        
+
         # Initialize reward model
         self._init_reward_model()
 
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
             return
-        
+
         # Synchronize all non-prepared components
         all_names = self.adapter._resolve_component_names()
         for name in all_names:
@@ -307,7 +401,7 @@ class BaseTrainer(ABC):
         torch_autocast_dtype fall through to the active torch.autocast state so
         the engine re-enables (rather than disables) autocast during forward.
         """
-        if getattr(accelerator.state, 'deepspeed_plugin', None) is None:
+        if getattr(accelerator.state, "deepspeed_plugin", None) is None:
             return
 
         try:
@@ -316,13 +410,13 @@ class BaseTrainer(ABC):
         except ImportError:
             return
 
-        if getattr(DeepSpeedEngine, '_ff_autocast_patched', False):
+        if getattr(DeepSpeedEngine, "_ff_autocast_patched", False):
             return
 
-        if hasattr(_ds_ac, 'validate_nested_autocast'):
+        if hasattr(_ds_ac, "validate_nested_autocast"):
             _ds_ac.validate_nested_autocast = lambda engine: None
 
-        if hasattr(DeepSpeedEngine, 'torch_autocast_enabled'):
+        if hasattr(DeepSpeedEngine, "torch_autocast_enabled"):
             _orig_enabled = DeepSpeedEngine.torch_autocast_enabled
             _orig_dtype = DeepSpeedEngine.torch_autocast_dtype
 
@@ -376,10 +470,10 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
     def load_checkpoint(
-            self,
-            path: str,
-            resume_type: Optional[Literal['lora', 'full', 'state']] = None,
-        ):
+        self,
+        path: str,
+        resume_type: Optional[Literal["lora", "full", "state"]] = None,
+    ):
         """Load trainer state from a specific path."""
         self.adapter.load_checkpoint(
             path=path,

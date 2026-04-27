@@ -241,6 +241,13 @@ class RewardProcessor:
         if method is not None:
             method()
 
+    def _release_cuda_cache_before_remote_reward(self) -> None:
+        """Release idle CUDA cache before a remote reward server loads on GPU."""
+        if self.accelerator.device.type != 'cuda' or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(self.accelerator.device)
+        torch.cuda.empty_cache()
+
     def _compute_main_process_remote_pointwise_reward(
         self,
         name: str,
@@ -270,6 +277,9 @@ class RewardProcessor:
         max_workers = self._resolve_remote_max_concurrent_requests(name, model)
         should_offload = self._resolve_remote_offload_after_compute(name, model)
         error_message = None
+
+        self._release_cuda_cache_before_remote_reward()
+        self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_main_process:
             try:

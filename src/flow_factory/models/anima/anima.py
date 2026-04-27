@@ -23,7 +23,6 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 import numpy as np
 import torch
 from accelerate import Accelerator
-from diffusers import DiffusionPipeline
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler as DiffusersFlowMatchEulerDiscreteScheduler,
 )
@@ -31,6 +30,8 @@ from diffusers.utils.torch_utils import randn_tensor
 from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file
+
+from diffusers import DiffusionPipeline
 
 from ...hparams import Arguments
 from ...samples import T2ISample
@@ -147,7 +148,9 @@ def _get_anima_param_groups(
             continue
         if params:
             param_groups.append({"params": params, "lr": lr})
-            logger.info(f"Prepared Anima parameter group `{group_name}` with {len(params)} tensors at lr={lr}.")
+            logger.info(
+                f"Prepared Anima parameter group `{group_name}` with {len(params)} tensors at lr={lr}."
+            )
 
     return param_groups
 
@@ -340,11 +343,17 @@ class AnimaAdapter(BaseAdapter):
     def load_pipeline(self) -> AnimaPipeline:
         """Load the Anima runtime components through sd-scripts helpers."""
         if self.model_args.qwen3 is None:
-            raise ValueError("Anima requires `model.qwen3` to point to the Qwen3 text encoder checkpoint.")
+            raise ValueError(
+                "Anima requires `model.qwen3` to point to the Qwen3 text encoder checkpoint."
+            )
         if self.model_args.vae is None:
-            raise ValueError("Anima requires `model.vae` to point to the Qwen-Image VAE checkpoint.")
+            raise ValueError(
+                "Anima requires `model.vae` to point to the Qwen-Image VAE checkpoint."
+            )
 
-        anima_utils, qwen_image_autoencoder_kl = _load_anima_runtime_modules(self.model_args.sd_scripts_root)
+        anima_utils, qwen_image_autoencoder_kl = _load_anima_runtime_modules(
+            self.model_args.sd_scripts_root
+        )
         self._anima_utils = anima_utils
         self._qwen_image_autoencoder_kl = qwen_image_autoencoder_kl
 
@@ -384,7 +393,9 @@ class AnimaAdapter(BaseAdapter):
                 key[len("llm_adapter.") :] if key.startswith("llm_adapter.") else key: value
                 for key, value in llm_adapter_state_dict.items()
             }
-            missing, unexpected = transformer.llm_adapter.load_state_dict(stripped_state_dict, strict=False)
+            missing, unexpected = transformer.llm_adapter.load_state_dict(
+                stripped_state_dict, strict=False
+            )
             if missing or unexpected:
                 raise RuntimeError(
                     "Failed to load `model.llm_adapter_path` into the Anima transformer. "
@@ -444,7 +455,9 @@ class AnimaAdapter(BaseAdapter):
         with torch.no_grad():
             outputs = self.text_encoder(input_ids=prompt_ids, attention_mask=prompt_embeds_mask)
         prompt_embeds = outputs.last_hidden_state.to(device=device, dtype=dtype)
-        prompt_embeds = prompt_embeds * prompt_embeds_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
+        prompt_embeds = prompt_embeds * prompt_embeds_mask.unsqueeze(-1).to(
+            dtype=prompt_embeds.dtype
+        )
 
         t5_encoding = self.pipeline.t5_tokenizer.batch_encode_plus(
             prompt,
@@ -463,6 +476,20 @@ class AnimaAdapter(BaseAdapter):
             "t5_input_ids": t5_input_ids,
             "t5_attn_mask": t5_attn_mask,
         }
+
+    def _transformer_dtype(self) -> torch.dtype:
+        """Return the transformer parameter dtype through accelerator wrappers."""
+        transformer = self.transformer
+        dtype = getattr(transformer, "dtype", None)
+        if dtype is not None:
+            return dtype
+
+        unwrapped = self._unwrap(transformer)
+        dtype = getattr(unwrapped, "dtype", None)
+        if dtype is not None:
+            return dtype
+
+        return next(unwrapped.parameters()).dtype
 
     def encode_prompt(
         self,
@@ -603,7 +630,7 @@ class AnimaAdapter(BaseAdapter):
         """Run a single Anima denoising step and optional scheduler transition."""
         del kwargs
         batch_size = latents.shape[0]
-        model_dtype = self.transformer.dtype
+        model_dtype = self._transformer_dtype()
         model_device = next(self.transformer.parameters()).device
 
         timestep = self._as_batch_tensor(t, batch_size, model_device, model_dtype) / 1000.0
@@ -694,9 +721,14 @@ class AnimaAdapter(BaseAdapter):
             raise ValueError(f"Anima requires height/width divisible by 16, got {height}x{width}.")
 
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self._transformer_dtype()
 
-        if prompt_embeds is None or prompt_embeds_mask is None or t5_input_ids is None or t5_attn_mask is None:
+        if (
+            prompt_embeds is None
+            or prompt_embeds_mask is None
+            or t5_input_ids is None
+            or t5_attn_mask is None
+        ):
             encoded = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -746,13 +778,17 @@ class AnimaAdapter(BaseAdapter):
         latent_collector.collect(latents, step_idx=0)
         log_prob_collector = None
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, current_t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(current_t)
             next_t = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(["next_latents", "log_prob", "noise_pred"] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "noise_pred"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -787,13 +823,17 @@ class AnimaAdapter(BaseAdapter):
 
         decoded_images = self.decode_latents(latents, output_type="pt")
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
-        negative_prompt_list = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+        negative_prompt_list = (
+            [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+        )
         extra_call_back_res = callback_collector.get_result()
         callback_index_map = callback_collector.get_index_map()
         all_latents = latent_collector.get_result()
         latent_index_map = latent_collector.get_index_map()
         all_log_probs = log_prob_collector.get_result() if log_prob_collector is not None else None
-        log_prob_index_map = log_prob_collector.get_index_map() if log_prob_collector is not None else None
+        log_prob_index_map = (
+            log_prob_collector.get_index_map() if log_prob_collector is not None else None
+        )
 
         return [
             AnimaSample(
@@ -819,18 +859,26 @@ class AnimaAdapter(BaseAdapter):
                 prompt_embeds_mask=prompt_embeds_mask[b],
                 t5_input_ids=t5_input_ids[b],
                 t5_attn_mask=t5_attn_mask[b],
-                negative_prompt=negative_prompt_list[b] if negative_prompt_list is not None else None,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
+                negative_prompt=(
+                    negative_prompt_list[b] if negative_prompt_list is not None else None
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
                 negative_prompt_embeds=(
                     negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
                 ),
                 negative_prompt_embeds_mask=(
-                    negative_prompt_embeds_mask[b] if negative_prompt_embeds_mask is not None else None
+                    negative_prompt_embeds_mask[b]
+                    if negative_prompt_embeds_mask is not None
+                    else None
                 ),
                 negative_t5_input_ids=(
                     negative_t5_input_ids[b] if negative_t5_input_ids is not None else None
                 ),
-                negative_t5_attn_mask=negative_t5_attn_mask[b] if negative_t5_attn_mask is not None else None,
+                negative_t5_attn_mask=(
+                    negative_t5_attn_mask[b] if negative_t5_attn_mask is not None else None
+                ),
                 extra_kwargs={
                     **{key: value[b] for key, value in extra_call_back_res.items()},
                     "callback_index_map": callback_index_map,
