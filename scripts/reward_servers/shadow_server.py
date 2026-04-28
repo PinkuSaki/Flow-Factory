@@ -32,6 +32,7 @@ import json
 import logging
 import sys
 import threading
+import time
 import types
 from contextlib import nullcontext
 from enum import Enum
@@ -97,7 +98,6 @@ except Exception:  # noqa: BLE001
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 
-
 LOGGER = logging.getLogger("shadow_server")
 
 
@@ -134,6 +134,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Maximum batch size per forward pass.",
+    )
+    parser.add_argument(
+        "--disable-data-parallel",
+        action="store_true",
+        help=(
+            "Disable torch.nn.DataParallel. By default, CUDA inference uses all "
+            "visible GPUs when more than one GPU is available."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -181,12 +189,15 @@ class AestheticShadowService:
         dtype: str,
         score_type: str,
         max_batch_size: int,
+        disable_data_parallel: bool,
     ) -> None:
         self.model_path = model_path
-        self.device = torch.device(device)
+        self.device = self._resolve_device(device, disable_data_parallel)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.score_type = score_type
         self.max_batch_size = max_batch_size
+        self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
+        self.data_parallel_enabled = len(self.device_ids) > 1
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
@@ -197,10 +208,57 @@ class AestheticShadowService:
             torch_dtype=self.dtype,
         )
         self.model.eval()
+        self.inference_model: torch.nn.Module = self.model
 
         label_to_id = getattr(self.model.config, "label2id", {}) or {}
         self.hq_index = int(label_to_id.get("hq", 0))
         self.lq_index = int(label_to_id.get("lq", 1 if self.hq_index == 0 else 0))
+
+        LOGGER.info(
+            "Aesthetic Shadow device config: device=%s dtype=%s visible_cuda_devices=%s "
+            "data_parallel=%s device_ids=%s",
+            self.device,
+            self.dtype,
+            torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            self.data_parallel_enabled,
+            self.device_ids,
+        )
+
+    @staticmethod
+    def _resolve_device(device: str, disable_data_parallel: bool) -> torch.device:
+        """Resolve the primary inference device."""
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            return resolved
+
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device was requested, but CUDA is not available.")
+
+        if (
+            not disable_data_parallel
+            and torch.cuda.device_count() > 1
+            and resolved.index not in {None, 0}
+        ):
+            raise ValueError(
+                "Data-parallel shadow inference uses all visible CUDA devices and "
+                "requires --device cuda or --device cuda:0. Use "
+                "--disable-data-parallel for a single indexed CUDA device."
+            )
+
+        return torch.device("cuda:0" if resolved.index is None else resolved)
+
+    def _resolve_data_parallel_device_ids(
+        self,
+        disable_data_parallel: bool,
+    ) -> list[int]:
+        """Return CUDA device ids used by torch.nn.DataParallel."""
+        if self.device.type != "cuda" or disable_data_parallel:
+            return []
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return []
+        return list(range(device_count))
 
     def ensure_on_device(self) -> None:
         """Move the Aesthetic Shadow model to its inference device."""
@@ -213,6 +271,15 @@ class AestheticShadowService:
             return
         self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
+        if self.data_parallel_enabled:
+            self.inference_model = torch.nn.DataParallel(
+                self.model,
+                device_ids=self.device_ids,
+                output_device=self.device_ids[0],
+            )
+            self.inference_model.eval()
+        else:
+            self.inference_model = self.model
         self._loaded_on_device = True
 
     def offload_to_cpu(self) -> None:
@@ -226,11 +293,14 @@ class AestheticShadowService:
         """Move the model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
+        self.inference_model = self.model
         self.model.to("cpu")
         self.model.eval()
         self._loaded_on_device = False
         if self.device.type == "cuda":
-            torch.cuda.empty_cache()
+            for device_id in self.device_ids or [self.device.index or 0]:
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
 
     def _enter_compute(self) -> None:
         """Mark a compute request active and ensure the model is loaded."""
@@ -256,10 +326,20 @@ class AestheticShadowService:
         video_payload: Optional[list[list[str]]],
     ) -> list[float]:
         """Compute rewards for a batch of images or videos."""
+        start_time = time.perf_counter()
         images = _resolve_media_payload(image_payload, video_payload)
         if not images:
             raise ValueError("At least one image or video input is required.")
 
+        LOGGER.info(
+            "Shadow compute request: samples=%s max_batch_size=%s score_type=%s "
+            "data_parallel=%s active_gpus=%s",
+            len(images),
+            self.max_batch_size,
+            self.score_type,
+            self.data_parallel_enabled,
+            len(self.device_ids) if self.data_parallel_enabled else 1,
+        )
         rewards: list[float] = []
 
         self._enter_compute()
@@ -271,7 +351,7 @@ class AestheticShadowService:
                     inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
                     with self._get_autocast_context():
-                        logits = self.model(**inputs).logits
+                        logits = self.inference_model(**inputs, return_dict=False)[0]
 
                     if self.score_type == "logit_margin":
                         batch_scores = logits[:, self.hq_index] - logits[:, self.lq_index]
@@ -282,6 +362,15 @@ class AestheticShadowService:
         finally:
             self._exit_compute()
 
+        LOGGER.info(
+            "Shadow compute complete: samples=%s forward_batches=%s data_parallel=%s "
+            "active_gpus=%s elapsed_s=%.3f",
+            len(images),
+            (len(images) + self.max_batch_size - 1) // self.max_batch_size,
+            self.data_parallel_enabled,
+            len(self.device_ids) if self.data_parallel_enabled else 1,
+            time.perf_counter() - start_time,
+        )
         return rewards
 
 
@@ -302,7 +391,16 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         """Handle GET requests."""
         if self.path == "/health":
-            self._send_json({"status": "ok"})
+            self._send_json(
+                {
+                    "status": "ok",
+                    "data_parallel": self.service.data_parallel_enabled,
+                    "active_gpus": (
+                        len(self.service.device_ids) if self.service.data_parallel_enabled else 1
+                    ),
+                    "device_ids": self.service.device_ids,
+                }
+            )
             return
         self._send_json(
             {"error": f"Unsupported path: {self.path}"},
@@ -365,6 +463,7 @@ def main() -> None:
         dtype=args.dtype,
         score_type=args.score_type,
         max_batch_size=args.max_batch_size,
+        disable_data_parallel=args.disable_data_parallel,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)

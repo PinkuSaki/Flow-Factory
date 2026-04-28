@@ -33,6 +33,7 @@ import base64
 import json
 import logging
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -41,13 +42,11 @@ from typing import Optional
 
 import torch
 from PIL import Image
-
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
     load_reference_cache,
     prompt_sha256,
 )
-
 
 LOGGER = logging.getLogger("wd_prompt_hash_server")
 
@@ -85,6 +84,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Maximum batch size per model forward pass.",
+    )
+    parser.add_argument(
+        "--disable-data-parallel",
+        action="store_true",
+        help=(
+            "Disable torch.nn.DataParallel. By default, CUDA inference uses all "
+            "visible GPUs when more than one GPU is available."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -130,6 +137,7 @@ class WDEVA02PromptHashService:
         device: str,
         dtype: str,
         max_batch_size: int,
+        disable_data_parallel: bool,
     ) -> None:
         self.cache_path = cache_path
         self._condition = threading.Condition(threading.Lock())
@@ -142,12 +150,22 @@ class WDEVA02PromptHashService:
             device=device,
             dtype=dtype,
             max_batch_size=max_batch_size,
+            disable_data_parallel=disable_data_parallel,
         )
 
         LOGGER.info(
             "Loaded %s WD reference embeddings from %s",
             len(self.reference_embeddings),
             cache_path,
+        )
+        LOGGER.info(
+            "WD prompt-hash device config: device=%s dtype=%s visible_cuda_devices=%s "
+            "data_parallel=%s device_ids=%s",
+            self.encoder.device,
+            self.encoder.dtype,
+            torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            self.encoder.data_parallel_enabled,
+            self.encoder.device_ids,
         )
 
     def ensure_on_device(self) -> None:
@@ -195,6 +213,7 @@ class WDEVA02PromptHashService:
         video_payload: Optional[list[list[str]]],
     ) -> list[float]:
         """Compute cosine similarity rewards for generated images."""
+        start_time = time.perf_counter()
         images = _resolve_media_payload(image_payload=image_payload, video_payload=video_payload)
         if not images:
             raise ValueError("At least one image or video input is required.")
@@ -215,6 +234,13 @@ class WDEVA02PromptHashService:
                 f"first missing hash: {missing_hashes[0]}"
             )
 
+        LOGGER.info(
+            "WD compute request: samples=%s max_batch_size=%s data_parallel=%s active_gpus=%s",
+            len(images),
+            self.encoder.max_batch_size,
+            self.encoder.data_parallel_enabled,
+            len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
+        )
         self._enter_compute()
         try:
             generated_embeddings = self.encoder.encode_images(images)
@@ -225,6 +251,15 @@ class WDEVA02PromptHashService:
             [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
         )
         rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
+        LOGGER.info(
+            "WD compute complete: samples=%s forward_batches=%s data_parallel=%s "
+            "active_gpus=%s elapsed_s=%.3f",
+            len(images),
+            (len(images) + self.encoder.max_batch_size - 1) // self.encoder.max_batch_size,
+            self.encoder.data_parallel_enabled,
+            len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
+            time.perf_counter() - start_time,
+        )
         return rewards.float().tolist()
 
 
@@ -250,6 +285,13 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "reference_count": len(self.service.reference_embeddings),
                     "cache_path": str(self.service.cache_path),
+                    "data_parallel": self.service.encoder.data_parallel_enabled,
+                    "active_gpus": (
+                        len(self.service.encoder.device_ids)
+                        if self.service.encoder.data_parallel_enabled
+                        else 1
+                    ),
+                    "device_ids": self.service.encoder.device_ids,
                 }
             )
             return
@@ -315,6 +357,7 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         max_batch_size=args.max_batch_size,
+        disable_data_parallel=args.disable_data_parallel,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)

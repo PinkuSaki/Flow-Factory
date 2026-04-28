@@ -150,11 +150,14 @@ class WDEVA02EmbeddingModel:
         device: str,
         dtype: str,
         max_batch_size: int,
+        disable_data_parallel: bool = False,
     ) -> None:
         self.model_path = model_path
-        self.device = torch.device(device)
+        self.device = self._resolve_device(device, disable_data_parallel)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.max_batch_size = max_batch_size
+        self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
+        self.data_parallel_enabled = len(self.device_ids) > 1
 
         self.model_config = _load_model_config(model_path)
         pretrained_cfg = self.model_config.get("pretrained_cfg", {})
@@ -162,11 +165,47 @@ class WDEVA02EmbeddingModel:
         self.image_mean = tuple(
             float(value) for value in pretrained_cfg.get("mean", [0.5, 0.5, 0.5])
         )
-        self.image_std = tuple(
-            float(value) for value in pretrained_cfg.get("std", [0.5, 0.5, 0.5])
-        )
+        self.image_std = tuple(float(value) for value in pretrained_cfg.get("std", [0.5, 0.5, 0.5]))
 
         self.model = self._load_wd_model()
+        self.feature_model = WDEVA02FeatureExtractor(self.model)
+        self.inference_model: torch.nn.Module = self.feature_model
+
+    @staticmethod
+    def _resolve_device(device: str, disable_data_parallel: bool) -> torch.device:
+        """Resolve the primary inference device."""
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            return resolved
+
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device was requested, but CUDA is not available.")
+
+        if (
+            not disable_data_parallel
+            and torch.cuda.device_count() > 1
+            and resolved.index not in {None, 0}
+        ):
+            raise ValueError(
+                "Data-parallel WD inference uses all visible CUDA devices and "
+                "requires --device cuda or --device cuda:0. Use "
+                "--disable-data-parallel for a single indexed CUDA device."
+            )
+
+        return torch.device("cuda:0" if resolved.index is None else resolved)
+
+    def _resolve_data_parallel_device_ids(
+        self,
+        disable_data_parallel: bool,
+    ) -> list[int]:
+        """Return CUDA device ids used by torch.nn.DataParallel."""
+        if self.device.type != "cuda" or disable_data_parallel:
+            return []
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return []
+        return list(range(device_count))
 
     def _load_wd_model(self) -> torch.nn.Module:
         """Load the WD EVA02 timm model from a local safetensors checkpoint."""
@@ -192,14 +231,27 @@ class WDEVA02EmbeddingModel:
 
     def ensure_on_device(self) -> None:
         """Move the WD model to its inference device."""
-        self.model.to(device=self.device, dtype=self.dtype)
-        self.model.eval()
+        self.feature_model.to(device=self.device, dtype=self.dtype)
+        self.feature_model.eval()
+        if self.data_parallel_enabled:
+            self.inference_model = torch.nn.DataParallel(
+                self.feature_model,
+                device_ids=self.device_ids,
+                output_device=self.device_ids[0],
+            )
+            self.inference_model.eval()
+        else:
+            self.inference_model = self.feature_model
 
     def offload_to_cpu(self) -> None:
         """Move the WD model to CPU and release CUDA cache when applicable."""
-        self.model.to("cpu")
+        self.inference_model = self.feature_model
+        self.feature_model.to("cpu")
+        self.feature_model.eval()
         if self.device.type == "cuda":
-            torch.cuda.empty_cache()
+            for device_id in self.device_ids or [self.device.index or 0]:
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
 
     def _get_autocast_context(self):
         """Create a fresh autocast context for one forward pass."""
@@ -222,16 +274,6 @@ class WDEVA02EmbeddingModel:
 
         return torch.stack(tensors, dim=0)
 
-    def _pool_features(self, features: torch.Tensor) -> torch.Tensor:
-        """Pool raw model features when the timm head API is unavailable."""
-        if features.ndim == 4:
-            return features.mean(dim=(2, 3))
-        if features.ndim == 3:
-            return features.mean(dim=1)
-        if features.ndim == 2:
-            return features
-        raise ValueError(f"Unsupported WD feature shape: {tuple(features.shape)}")
-
     @torch.inference_mode()
     def encode_images(self, images: list[Image.Image]) -> torch.Tensor:
         """Extract normalized WD image embeddings."""
@@ -244,27 +286,49 @@ class WDEVA02EmbeddingModel:
             )
 
             with self._get_autocast_context():
-                if hasattr(self.model, "forward_features"):
-                    features = self.model.forward_features(batch)
-                    if hasattr(self.model, "forward_head"):
-                        try:
-                            features = self.model.forward_head(features, pre_logits=True)
-                        except TypeError:
-                            features = self.model.forward_head(features)
-                    else:
-                        features = self._pool_features(features)
-                else:
-                    features = self.model(batch)
-
-            if isinstance(features, (tuple, list)):
-                features = features[0]
-            if not isinstance(features, torch.Tensor):
-                raise TypeError(
-                    f"Expected WD features to be a tensor, got {type(features).__name__}."
-                )
-            if features.ndim != 2:
-                features = self._pool_features(features)
+                features = self.inference_model(batch)
 
             embeddings.append(F.normalize(features.float(), dim=-1).cpu())
 
         return torch.cat(embeddings, dim=0)
+
+
+class WDEVA02FeatureExtractor(torch.nn.Module):
+    """Expose WD feature extraction through a regular forward method."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    @staticmethod
+    def _pool_features(features: torch.Tensor) -> torch.Tensor:
+        """Pool raw model features when the timm head API is unavailable."""
+        if features.ndim == 4:
+            return features.mean(dim=(2, 3))
+        if features.ndim == 3:
+            return features.mean(dim=1)
+        if features.ndim == 2:
+            return features
+        raise ValueError(f"Unsupported WD feature shape: {tuple(features.shape)}")
+
+    def forward(self, batch: torch.Tensor) -> torch.Tensor:
+        """Extract one batch of WD features."""
+        if hasattr(self.model, "forward_features"):
+            features = self.model.forward_features(batch)
+            if hasattr(self.model, "forward_head"):
+                try:
+                    features = self.model.forward_head(features, pre_logits=True)
+                except TypeError:
+                    features = self.model.forward_head(features)
+            else:
+                features = self._pool_features(features)
+        else:
+            features = self.model(batch)
+
+        if isinstance(features, (tuple, list)):
+            features = features[0]
+        if not isinstance(features, torch.Tensor):
+            raise TypeError(f"Expected WD features to be a tensor, got {type(features).__name__}.")
+        if features.ndim != 2:
+            features = self._pool_features(features)
+        return features
