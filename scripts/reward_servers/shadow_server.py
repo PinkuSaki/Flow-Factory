@@ -130,12 +130,6 @@ def parse_args() -> argparse.Namespace:
         help="Reward scoring rule.",
     )
     parser.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=16,
-        help="Maximum batch size per forward pass.",
-    )
-    parser.add_argument(
         "--disable-data-parallel",
         action="store_true",
         help=(
@@ -188,14 +182,12 @@ class AestheticShadowService:
         device: str,
         dtype: str,
         score_type: str,
-        max_batch_size: int,
         disable_data_parallel: bool,
     ) -> None:
         self.model_path = model_path
         self.device = self._resolve_device(device, disable_data_parallel)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.score_type = score_type
-        self.max_batch_size = max_batch_size
         self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
         self.data_parallel_enabled = len(self.device_ids) > 1
         self._condition = threading.Condition(threading.Lock())
@@ -332,41 +324,34 @@ class AestheticShadowService:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Shadow compute request: samples=%s max_batch_size=%s score_type=%s "
-            "data_parallel=%s active_gpus=%s",
+            "Shadow compute request: samples=%s score_type=%s data_parallel=%s active_gpus=%s",
             len(images),
-            self.max_batch_size,
             self.score_type,
             self.data_parallel_enabled,
             len(self.device_ids) if self.data_parallel_enabled else 1,
         )
-        rewards: list[float] = []
 
         self._enter_compute()
         try:
             with torch.inference_mode():
-                for start in range(0, len(images), self.max_batch_size):
-                    batch_images = images[start : start + self.max_batch_size]
-                    inputs = self.processor(images=batch_images, return_tensors="pt")
-                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                inputs = self.processor(images=images, return_tensors="pt")
+                inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-                    with self._get_autocast_context():
-                        logits = self.inference_model(**inputs, return_dict=False)[0]
+                with self._get_autocast_context():
+                    logits = self.inference_model(**inputs, return_dict=False)[0]
 
-                    if self.score_type == "logit_margin":
-                        batch_scores = logits[:, self.hq_index] - logits[:, self.lq_index]
-                    else:
-                        batch_scores = logits.softmax(dim=-1)[:, self.hq_index]
+                if self.score_type == "logit_margin":
+                    scores = logits[:, self.hq_index] - logits[:, self.lq_index]
+                else:
+                    scores = logits.softmax(dim=-1)[:, self.hq_index]
 
-                    rewards.extend(batch_scores.detach().cpu().float().tolist())
+                rewards = scores.detach().cpu().float().tolist()
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "Shadow compute complete: samples=%s forward_batches=%s data_parallel=%s "
-            "active_gpus=%s elapsed_s=%.3f",
+            "Shadow compute complete: samples=%s data_parallel=%s active_gpus=%s elapsed_s=%.3f",
             len(images),
-            (len(images) + self.max_batch_size - 1) // self.max_batch_size,
             self.data_parallel_enabled,
             len(self.device_ids) if self.data_parallel_enabled else 1,
             time.perf_counter() - start_time,
@@ -462,7 +447,6 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         score_type=args.score_type,
-        max_batch_size=args.max_batch_size,
         disable_data_parallel=args.disable_data_parallel,
     )
 

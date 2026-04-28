@@ -149,13 +149,15 @@ class WDEVA02EmbeddingModel:
         model_path: Path,
         device: str,
         dtype: str,
-        max_batch_size: int,
+        max_batch_size: Optional[int] = None,
         disable_data_parallel: bool = False,
     ) -> None:
         self.model_path = model_path
         self.device = self._resolve_device(device, disable_data_parallel)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.max_batch_size = max_batch_size
+        if self.max_batch_size is not None and self.max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be positive or None, got {self.max_batch_size}.")
         self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
         self.data_parallel_enabled = len(self.device_ids) > 1
 
@@ -278,8 +280,9 @@ class WDEVA02EmbeddingModel:
     def encode_images(self, images: list[Image.Image]) -> torch.Tensor:
         """Extract normalized WD image embeddings."""
         embeddings = []
-        for start in range(0, len(images), self.max_batch_size):
-            batch_images = images[start : start + self.max_batch_size]
+        batch_size = self.max_batch_size or len(images)
+        for start in range(0, len(images), batch_size):
+            batch_images = images[start : start + batch_size]
             batch = self._preprocess_images(batch_images).to(
                 device=self.device,
                 dtype=self.dtype,
