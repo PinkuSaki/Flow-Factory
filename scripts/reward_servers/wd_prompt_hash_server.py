@@ -80,12 +80,6 @@ def parse_args() -> argparse.Namespace:
         help="Torch dtype for CUDA inference. CPU inference always uses float32.",
     )
     parser.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=16,
-        help="Maximum batch size per model forward pass.",
-    )
-    parser.add_argument(
         "--disable-data-parallel",
         action="store_true",
         help=(
@@ -136,7 +130,6 @@ class WDEVA02PromptHashService:
         cache_path: Path,
         device: str,
         dtype: str,
-        max_batch_size: int,
         disable_data_parallel: bool,
     ) -> None:
         self.cache_path = cache_path
@@ -149,7 +142,6 @@ class WDEVA02PromptHashService:
             model_path=model_path,
             device=device,
             dtype=dtype,
-            max_batch_size=max_batch_size,
             disable_data_parallel=disable_data_parallel,
         )
 
@@ -235,9 +227,8 @@ class WDEVA02PromptHashService:
             )
 
         LOGGER.info(
-            "WD compute request: samples=%s max_batch_size=%s data_parallel=%s active_gpus=%s",
+            "WD compute request: samples=%s data_parallel=%s active_gpus=%s",
             len(images),
-            self.encoder.max_batch_size,
             self.encoder.data_parallel_enabled,
             len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
         )
@@ -252,10 +243,8 @@ class WDEVA02PromptHashService:
         )
         rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
         LOGGER.info(
-            "WD compute complete: samples=%s forward_batches=%s data_parallel=%s "
-            "active_gpus=%s elapsed_s=%.3f",
+            "WD compute complete: samples=%s data_parallel=%s active_gpus=%s elapsed_s=%.3f",
             len(images),
-            (len(images) + self.encoder.max_batch_size - 1) // self.encoder.max_batch_size,
             self.encoder.data_parallel_enabled,
             len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
             time.perf_counter() - start_time,
@@ -356,7 +345,6 @@ def main() -> None:
         cache_path=args.cache_path,
         device=args.device,
         dtype=args.dtype,
-        max_batch_size=args.max_batch_size,
         disable_data_parallel=args.disable_data_parallel,
     )
 
