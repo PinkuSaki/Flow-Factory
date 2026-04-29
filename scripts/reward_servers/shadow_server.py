@@ -96,7 +96,8 @@ try:
 except Exception:  # noqa: BLE001
     _install_torchvision_stub()
 
-from transformers import ViTForImageClassification, ViTImageProcessor
+from ddp_worker_pool import DDPWorkerPool
+from transformers import AutoConfig, ViTForImageClassification, ViTImageProcessor
 
 LOGGER = logging.getLogger("shadow_server")
 
@@ -130,11 +131,11 @@ def parse_args() -> argparse.Namespace:
         help="Reward scoring rule.",
     )
     parser.add_argument(
-        "--disable-data-parallel",
+        "--disable-ddp",
         action="store_true",
         help=(
-            "Disable torch.nn.DataParallel. By default, CUDA inference uses all "
-            "visible GPUs when more than one GPU is available."
+            "Disable server-side DDP. By default, CUDA inference starts one "
+            "worker process per visible GPU when more than one GPU is available."
         ),
     )
     parser.add_argument(
@@ -173,6 +174,93 @@ def _resolve_media_payload(
     return images
 
 
+def _count_media_payload(
+    image_payload: Optional[list[str]],
+    video_payload: Optional[list[list[str]]],
+) -> int:
+    """Count image or video samples without decoding image bytes."""
+    if image_payload:
+        return len(image_payload)
+
+    if not video_payload:
+        return 0
+
+    for frames in video_payload:
+        if not frames:
+            raise ValueError("Encountered an empty video payload.")
+    return len(video_payload)
+
+
+class AestheticShadowDDPWorker:
+    """DDP worker for one Aesthetic Shadow GPU rank."""
+
+    def __init__(
+        self,
+        *,
+        local_rank: int,
+        world_size: int,
+        model_path: Path,
+        dtype: str,
+        score_type: str,
+    ) -> None:
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.model_path = model_path
+        self.device = torch.device(f"cuda:{local_rank}")
+        self.dtype = getattr(torch, dtype)
+        self.score_type = score_type
+
+        self.processor = ViTImageProcessor.from_pretrained(str(model_path))
+        model = ViTForImageClassification.from_pretrained(
+            str(model_path),
+            torch_dtype=self.dtype,
+        )
+        model.to(device=self.device, dtype=self.dtype)
+        model.eval()
+        self.inference_model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+        )
+        self.inference_model.eval()
+
+        label_to_id = getattr(model.config, "label2id", {}) or {}
+        self.hq_index = int(label_to_id.get("hq", 0))
+        self.lq_index = int(label_to_id.get("lq", 1 if self.hq_index == 0 else 0))
+
+    def _get_autocast_context(self):
+        """Create a fresh autocast context for one forward pass."""
+        if self.dtype != torch.float32:
+            return torch.autocast(device_type="cuda", dtype=self.dtype)
+        return nullcontext()
+
+    def compute(self, payload: dict[str, Any]) -> list[float]:
+        """Compute one DDP rank shard."""
+        images = _resolve_media_payload(payload.get("image"), payload.get("video"))
+        if not images:
+            raise ValueError("At least one image or video input is required.")
+
+        with torch.inference_mode():
+            inputs = self.processor(images=images, return_tensors="pt")
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+            with self._get_autocast_context():
+                logits = self.inference_model(**inputs, return_dict=False)[0]
+
+            if self.score_type == "logit_margin":
+                scores = logits[:, self.hq_index] - logits[:, self.lq_index]
+            else:
+                scores = logits.softmax(dim=-1)[:, self.hq_index]
+
+            return scores.detach().cpu().float().tolist()
+
+    def close(self) -> None:
+        """Release CUDA memory held by this worker."""
+        del self.inference_model
+        torch.cuda.empty_cache()
+
+
 class AestheticShadowService:
     """Wrapper around the Aesthetic Shadow model."""
 
@@ -182,42 +270,61 @@ class AestheticShadowService:
         device: str,
         dtype: str,
         score_type: str,
-        disable_data_parallel: bool,
+        disable_ddp: bool,
     ) -> None:
         self.model_path = model_path
-        self.device = self._resolve_device(device, disable_data_parallel)
+        self.device = self._resolve_device(device, disable_ddp)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
+        self.dtype_name = dtype if self.device.type == "cuda" else "float32"
         self.score_type = score_type
-        self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
-        self.data_parallel_enabled = len(self.device_ids) > 1
+        self.device_ids = self._resolve_ddp_device_ids(disable_ddp)
+        self.ddp_enabled = len(self.device_ids) > 1
+        self.ddp_pool: Optional[DDPWorkerPool] = None
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
 
-        self.processor = ViTImageProcessor.from_pretrained(str(model_path))
-        self.model = ViTForImageClassification.from_pretrained(
-            str(model_path),
-            torch_dtype=self.dtype,
-        )
-        self.model.eval()
-        self.inference_model: torch.nn.Module = self.model
-
-        label_to_id = getattr(self.model.config, "label2id", {}) or {}
+        config = AutoConfig.from_pretrained(str(model_path))
+        label_to_id = getattr(config, "label2id", {}) or {}
         self.hq_index = int(label_to_id.get("hq", 0))
         self.lq_index = int(label_to_id.get("lq", 1 if self.hq_index == 0 else 0))
 
+        if self.ddp_enabled:
+            self.processor = None
+            self.model = None
+            self.inference_model = None
+            self.ddp_pool = DDPWorkerPool(
+                worker_factory=AestheticShadowDDPWorker,
+                worker_kwargs={
+                    "model_path": model_path,
+                    "dtype": self.dtype_name,
+                    "score_type": score_type,
+                },
+                world_size=len(self.device_ids),
+                batch_keys=("image", "video"),
+                logger=LOGGER,
+            )
+        else:
+            self.processor = ViTImageProcessor.from_pretrained(str(model_path))
+            self.model = ViTForImageClassification.from_pretrained(
+                str(model_path),
+                torch_dtype=self.dtype,
+            )
+            self.model.eval()
+            self.inference_model: Optional[torch.nn.Module] = self.model
+
         LOGGER.info(
             "Aesthetic Shadow device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "data_parallel=%s device_ids=%s",
+            "ddp=%s device_ids=%s",
             self.device,
             self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            self.data_parallel_enabled,
+            self.ddp_enabled,
             self.device_ids,
         )
 
     @staticmethod
-    def _resolve_device(device: str, disable_data_parallel: bool) -> torch.device:
+    def _resolve_device(device: str, disable_ddp: bool) -> torch.device:
         """Resolve the primary inference device."""
         resolved = torch.device(device)
         if resolved.type != "cuda":
@@ -226,25 +333,21 @@ class AestheticShadowService:
         if not torch.cuda.is_available():
             raise ValueError("CUDA device was requested, but CUDA is not available.")
 
-        if (
-            not disable_data_parallel
-            and torch.cuda.device_count() > 1
-            and resolved.index not in {None, 0}
-        ):
+        if not disable_ddp and torch.cuda.device_count() > 1 and resolved.index not in {None, 0}:
             raise ValueError(
-                "Data-parallel shadow inference uses all visible CUDA devices and "
+                "DDP shadow inference uses all visible CUDA devices and "
                 "requires --device cuda or --device cuda:0. Use "
-                "--disable-data-parallel for a single indexed CUDA device."
+                "--disable-ddp for a single indexed CUDA device."
             )
 
         return torch.device("cuda:0" if resolved.index is None else resolved)
 
-    def _resolve_data_parallel_device_ids(
+    def _resolve_ddp_device_ids(
         self,
-        disable_data_parallel: bool,
+        disable_ddp: bool,
     ) -> list[int]:
-        """Return CUDA device ids used by torch.nn.DataParallel."""
-        if self.device.type != "cuda" or disable_data_parallel:
+        """Return CUDA device ids used by DDP workers."""
+        if self.device.type != "cuda" or disable_ddp:
             return []
 
         device_count = torch.cuda.device_count()
@@ -261,17 +364,17 @@ class AestheticShadowService:
         """Move the model to its inference device while holding the condition."""
         if self._loaded_on_device:
             return
+        if self.ddp_enabled:
+            if self.ddp_pool is None:
+                raise RuntimeError("DDP worker pool is not initialized.")
+            self.ddp_pool.start()
+            self._loaded_on_device = True
+            return
+        if self.model is None:
+            raise RuntimeError("Aesthetic Shadow model is not initialized.")
         self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
-        if self.data_parallel_enabled:
-            self.inference_model = torch.nn.DataParallel(
-                self.model,
-                device_ids=self.device_ids,
-                output_device=self.device_ids[0],
-            )
-            self.inference_model.eval()
-        else:
-            self.inference_model = self.model
+        self.inference_model = self.model
         self._loaded_on_device = True
 
     def offload_to_cpu(self) -> None:
@@ -285,12 +388,19 @@ class AestheticShadowService:
         """Move the model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
+        if self.ddp_enabled:
+            if self.ddp_pool is not None:
+                self.ddp_pool.shutdown()
+            self._loaded_on_device = False
+            return
+        if self.model is None:
+            raise RuntimeError("Aesthetic Shadow model is not initialized.")
         self.inference_model = self.model
         self.model.to("cpu")
         self.model.eval()
         self._loaded_on_device = False
         if self.device.type == "cuda":
-            for device_id in self.device_ids or [self.device.index or 0]:
+            for device_id in [self.device.index or 0]:
                 with torch.cuda.device(device_id):
                     torch.cuda.empty_cache()
 
@@ -319,44 +429,60 @@ class AestheticShadowService:
     ) -> list[float]:
         """Compute rewards for a batch of images or videos."""
         start_time = time.perf_counter()
-        images = _resolve_media_payload(image_payload, video_payload)
-        if not images:
+        sample_count = _count_media_payload(image_payload, video_payload)
+        if sample_count <= 0:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Shadow compute request: samples=%s score_type=%s data_parallel=%s active_gpus=%s",
-            len(images),
+            "Shadow compute request: samples=%s score_type=%s ddp=%s active_gpus=%s",
+            sample_count,
             self.score_type,
-            self.data_parallel_enabled,
-            len(self.device_ids) if self.data_parallel_enabled else 1,
+            self.ddp_enabled,
+            len(self.device_ids) if self.ddp_enabled else 1,
         )
 
         self._enter_compute()
         try:
-            with torch.inference_mode():
-                inputs = self.processor(images=images, return_tensors="pt")
-                inputs = {key: value.to(self.device) for key, value in inputs.items()}
+            if self.ddp_enabled:
+                if self.ddp_pool is None:
+                    raise RuntimeError("DDP worker pool is not initialized.")
+                rewards = self.ddp_pool.compute(
+                    payload={"image": image_payload, "video": video_payload},
+                    total_size=sample_count,
+                )
+            else:
+                if self.processor is None or self.inference_model is None:
+                    raise RuntimeError("Aesthetic Shadow model is not initialized.")
+                images = _resolve_media_payload(image_payload, video_payload)
+                with torch.inference_mode():
+                    inputs = self.processor(images=images, return_tensors="pt")
+                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-                with self._get_autocast_context():
-                    logits = self.inference_model(**inputs, return_dict=False)[0]
+                    with self._get_autocast_context():
+                        logits = self.inference_model(**inputs, return_dict=False)[0]
 
-                if self.score_type == "logit_margin":
-                    scores = logits[:, self.hq_index] - logits[:, self.lq_index]
-                else:
-                    scores = logits.softmax(dim=-1)[:, self.hq_index]
+                    if self.score_type == "logit_margin":
+                        scores = logits[:, self.hq_index] - logits[:, self.lq_index]
+                    else:
+                        scores = logits.softmax(dim=-1)[:, self.hq_index]
 
-                rewards = scores.detach().cpu().float().tolist()
+                    rewards = scores.detach().cpu().float().tolist()
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "Shadow compute complete: samples=%s data_parallel=%s active_gpus=%s elapsed_s=%.3f",
-            len(images),
-            self.data_parallel_enabled,
-            len(self.device_ids) if self.data_parallel_enabled else 1,
+            "Shadow compute complete: samples=%s ddp=%s active_gpus=%s elapsed_s=%.3f",
+            sample_count,
+            self.ddp_enabled,
+            len(self.device_ids) if self.ddp_enabled else 1,
             time.perf_counter() - start_time,
         )
         return rewards
+
+    def close(self) -> None:
+        """Release server resources."""
+        with self._condition:
+            self._offload_to_cpu_locked()
 
 
 class RewardRequestHandler(BaseHTTPRequestHandler):
@@ -379,11 +505,11 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "status": "ok",
-                    "data_parallel": self.service.data_parallel_enabled,
-                    "active_gpus": (
-                        len(self.service.device_ids) if self.service.data_parallel_enabled else 1
-                    ),
+                    "ddp": self.service.ddp_enabled,
+                    "parallel_mode": "ddp" if self.service.ddp_enabled else "single",
+                    "active_gpus": len(self.service.device_ids) if self.service.ddp_enabled else 1,
                     "device_ids": self.service.device_ids,
+                    "loaded": self.service._loaded_on_device,
                 }
             )
             return
@@ -447,7 +573,7 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         score_type=args.score_type,
-        disable_data_parallel=args.disable_data_parallel,
+        disable_ddp=args.disable_ddp,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)
@@ -462,6 +588,7 @@ def main() -> None:
     except KeyboardInterrupt:
         LOGGER.info("Stopping Aesthetic Shadow reward server.")
     finally:
+        RewardRequestHandler.service.close()
         server.server_close()
 
 

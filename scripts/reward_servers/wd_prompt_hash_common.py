@@ -150,16 +150,13 @@ class WDEVA02EmbeddingModel:
         device: str,
         dtype: str,
         max_batch_size: Optional[int] = None,
-        disable_data_parallel: bool = False,
     ) -> None:
         self.model_path = model_path
-        self.device = self._resolve_device(device, disable_data_parallel)
+        self.device = self._resolve_device(device)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.max_batch_size = max_batch_size
         if self.max_batch_size is not None and self.max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive or None, got {self.max_batch_size}.")
-        self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
-        self.data_parallel_enabled = len(self.device_ids) > 1
 
         self.model_config = _load_model_config(model_path)
         pretrained_cfg = self.model_config.get("pretrained_cfg", {})
@@ -174,7 +171,7 @@ class WDEVA02EmbeddingModel:
         self.inference_model: torch.nn.Module = self.feature_model
 
     @staticmethod
-    def _resolve_device(device: str, disable_data_parallel: bool) -> torch.device:
+    def _resolve_device(device: str) -> torch.device:
         """Resolve the primary inference device."""
         resolved = torch.device(device)
         if resolved.type != "cuda":
@@ -183,31 +180,7 @@ class WDEVA02EmbeddingModel:
         if not torch.cuda.is_available():
             raise ValueError("CUDA device was requested, but CUDA is not available.")
 
-        if (
-            not disable_data_parallel
-            and torch.cuda.device_count() > 1
-            and resolved.index not in {None, 0}
-        ):
-            raise ValueError(
-                "Data-parallel WD inference uses all visible CUDA devices and "
-                "requires --device cuda or --device cuda:0. Use "
-                "--disable-data-parallel for a single indexed CUDA device."
-            )
-
         return torch.device("cuda:0" if resolved.index is None else resolved)
-
-    def _resolve_data_parallel_device_ids(
-        self,
-        disable_data_parallel: bool,
-    ) -> list[int]:
-        """Return CUDA device ids used by torch.nn.DataParallel."""
-        if self.device.type != "cuda" or disable_data_parallel:
-            return []
-
-        device_count = torch.cuda.device_count()
-        if device_count <= 1:
-            return []
-        return list(range(device_count))
 
     def _load_wd_model(self) -> torch.nn.Module:
         """Load the WD EVA02 timm model from a local safetensors checkpoint."""
@@ -235,15 +208,18 @@ class WDEVA02EmbeddingModel:
         """Move the WD model to its inference device."""
         self.feature_model.to(device=self.device, dtype=self.dtype)
         self.feature_model.eval()
-        if self.data_parallel_enabled:
-            self.inference_model = torch.nn.DataParallel(
-                self.feature_model,
-                device_ids=self.device_ids,
-                output_device=self.device_ids[0],
-            )
-            self.inference_model.eval()
-        else:
-            self.inference_model = self.feature_model
+        self.inference_model = self.feature_model
+
+    def wrap_ddp(self, local_rank: int) -> None:
+        """Wrap the WD feature extractor with DistributedDataParallel."""
+        self.ensure_on_device()
+        self.inference_model = torch.nn.parallel.DistributedDataParallel(
+            self.feature_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+        )
+        self.inference_model.eval()
 
     def offload_to_cpu(self) -> None:
         """Move the WD model to CPU and release CUDA cache when applicable."""
@@ -251,9 +227,8 @@ class WDEVA02EmbeddingModel:
         self.feature_model.to("cpu")
         self.feature_model.eval()
         if self.device.type == "cuda":
-            for device_id in self.device_ids or [self.device.index or 0]:
-                with torch.cuda.device(device_id):
-                    torch.cuda.empty_cache()
+            with torch.cuda.device(self.device.index or 0):
+                torch.cuda.empty_cache()
 
     def _get_autocast_context(self):
         """Create a fresh autocast context for one forward pass."""

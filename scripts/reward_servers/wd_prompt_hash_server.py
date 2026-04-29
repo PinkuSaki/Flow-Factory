@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from ddp_worker_pool import DDPWorkerPool
 from PIL import Image
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
@@ -80,11 +81,11 @@ def parse_args() -> argparse.Namespace:
         help="Torch dtype for CUDA inference. CPU inference always uses float32.",
     )
     parser.add_argument(
-        "--disable-data-parallel",
+        "--disable-ddp",
         action="store_true",
         help=(
-            "Disable torch.nn.DataParallel. By default, CUDA inference uses all "
-            "visible GPUs when more than one GPU is available."
+            "Disable server-side DDP. By default, CUDA inference starts one "
+            "worker process per visible GPU when more than one GPU is available."
         ),
     )
     parser.add_argument(
@@ -121,6 +122,83 @@ def _resolve_media_payload(
     return images
 
 
+def _count_media_payload(
+    image_payload: Optional[list[str]],
+    video_payload: Optional[list[list[str]]],
+) -> int:
+    """Count image or video samples without decoding image bytes."""
+    if image_payload:
+        return len(image_payload)
+
+    if not video_payload:
+        return 0
+
+    for frames in video_payload:
+        if not frames:
+            raise ValueError("Encountered an empty video payload.")
+    return len(video_payload)
+
+
+class WDEVA02PromptHashDDPWorker:
+    """DDP worker for one WD prompt-hash GPU rank."""
+
+    def __init__(
+        self,
+        *,
+        local_rank: int,
+        world_size: int,
+        model_path: Path,
+        cache_path: Path,
+        dtype: str,
+    ) -> None:
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.reference_embeddings = load_reference_cache(cache_path)
+        self.encoder = WDEVA02EmbeddingModel(
+            model_path=model_path,
+            device=f"cuda:{local_rank}",
+            dtype=dtype,
+        )
+        self.encoder.wrap_ddp(local_rank)
+
+    def compute(self, payload: dict) -> list[float]:
+        """Compute one DDP rank shard."""
+        prompts = payload.get("prompt") or []
+        images = _resolve_media_payload(
+            image_payload=payload.get("image"),
+            video_payload=payload.get("video"),
+        )
+        if not images:
+            raise ValueError("At least one image or video input is required.")
+        if len(prompts) != len(images):
+            raise ValueError(
+                f"Prompt/image length mismatch: prompts={len(prompts)} images={len(images)}"
+            )
+
+        prompt_hashes = [prompt_sha256(prompt) for prompt in prompts]
+        missing_hashes = [
+            prompt_hash
+            for prompt_hash in prompt_hashes
+            if prompt_hash not in self.reference_embeddings
+        ]
+        if missing_hashes:
+            raise KeyError(
+                f"Missing reference embeddings for {len(missing_hashes)} prompt hash(es), "
+                f"first missing hash: {missing_hashes[0]}"
+            )
+
+        generated_embeddings = self.encoder.encode_images(images)
+        reference_embeddings = torch.stack(
+            [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+        )
+        rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
+        return rewards.float().tolist()
+
+    def close(self) -> None:
+        """Release CUDA memory held by this worker."""
+        self.encoder.offload_to_cpu()
+
+
 class WDEVA02PromptHashService:
     """Compute generated-reference similarity rewards with prompt-hash lookup."""
 
@@ -130,20 +208,40 @@ class WDEVA02PromptHashService:
         cache_path: Path,
         device: str,
         dtype: str,
-        disable_data_parallel: bool,
+        disable_ddp: bool,
     ) -> None:
+        self.model_path = model_path
         self.cache_path = cache_path
+        self.device = self._resolve_device(device, disable_ddp)
+        self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
+        self.dtype_name = dtype if self.device.type == "cuda" else "float32"
+        self.device_ids = self._resolve_ddp_device_ids(disable_ddp)
+        self.ddp_enabled = len(self.device_ids) > 1
+        self.ddp_pool: Optional[DDPWorkerPool] = None
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
 
         self.reference_embeddings = load_reference_cache(cache_path)
-        self.encoder = WDEVA02EmbeddingModel(
-            model_path=model_path,
-            device=device,
-            dtype=dtype,
-            disable_data_parallel=disable_data_parallel,
-        )
+        if self.ddp_enabled:
+            self.encoder: Optional[WDEVA02EmbeddingModel] = None
+            self.ddp_pool = DDPWorkerPool(
+                worker_factory=WDEVA02PromptHashDDPWorker,
+                worker_kwargs={
+                    "model_path": model_path,
+                    "cache_path": cache_path,
+                    "dtype": self.dtype_name,
+                },
+                world_size=len(self.device_ids),
+                batch_keys=("prompt", "image", "video"),
+                logger=LOGGER,
+            )
+        else:
+            self.encoder = WDEVA02EmbeddingModel(
+                model_path=model_path,
+                device=str(self.device),
+                dtype=self.dtype_name,
+            )
 
         LOGGER.info(
             "Loaded %s WD reference embeddings from %s",
@@ -152,13 +250,42 @@ class WDEVA02PromptHashService:
         )
         LOGGER.info(
             "WD prompt-hash device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "data_parallel=%s device_ids=%s",
-            self.encoder.device,
-            self.encoder.dtype,
+            "ddp=%s device_ids=%s",
+            self.device,
+            self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            self.encoder.data_parallel_enabled,
-            self.encoder.device_ids,
+            self.ddp_enabled,
+            self.device_ids,
         )
+
+    @staticmethod
+    def _resolve_device(device: str, disable_ddp: bool) -> torch.device:
+        """Resolve the primary inference device."""
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            return resolved
+
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device was requested, but CUDA is not available.")
+
+        if not disable_ddp and torch.cuda.device_count() > 1 and resolved.index not in {None, 0}:
+            raise ValueError(
+                "DDP WD inference uses all visible CUDA devices and requires "
+                "--device cuda or --device cuda:0. Use --disable-ddp for a "
+                "single indexed CUDA device."
+            )
+
+        return torch.device("cuda:0" if resolved.index is None else resolved)
+
+    def _resolve_ddp_device_ids(self, disable_ddp: bool) -> list[int]:
+        """Return CUDA device ids used by DDP workers."""
+        if self.device.type != "cuda" or disable_ddp:
+            return []
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return []
+        return list(range(device_count))
 
     def ensure_on_device(self) -> None:
         """Move the WD model to its inference device."""
@@ -169,6 +296,14 @@ class WDEVA02PromptHashService:
         """Move the WD model to its inference device while holding the condition."""
         if self._loaded_on_device:
             return
+        if self.ddp_enabled:
+            if self.ddp_pool is None:
+                raise RuntimeError("DDP worker pool is not initialized.")
+            self.ddp_pool.start()
+            self._loaded_on_device = True
+            return
+        if self.encoder is None:
+            raise RuntimeError("WD encoder is not initialized.")
         self.encoder.ensure_on_device()
         self._loaded_on_device = True
 
@@ -183,6 +318,13 @@ class WDEVA02PromptHashService:
         """Move the WD model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
+        if self.ddp_enabled:
+            if self.ddp_pool is not None:
+                self.ddp_pool.shutdown()
+            self._loaded_on_device = False
+            return
+        if self.encoder is None:
+            raise RuntimeError("WD encoder is not initialized.")
         self.encoder.offload_to_cpu()
         self._loaded_on_device = False
 
@@ -206,12 +348,15 @@ class WDEVA02PromptHashService:
     ) -> list[float]:
         """Compute cosine similarity rewards for generated images."""
         start_time = time.perf_counter()
-        images = _resolve_media_payload(image_payload=image_payload, video_payload=video_payload)
-        if not images:
+        sample_count = _count_media_payload(
+            image_payload=image_payload,
+            video_payload=video_payload,
+        )
+        if sample_count <= 0:
             raise ValueError("At least one image or video input is required.")
-        if len(prompts) != len(images):
+        if len(prompts) != sample_count:
             raise ValueError(
-                f"Prompt/image length mismatch: prompts={len(prompts)} images={len(images)}"
+                f"Prompt/image length mismatch: prompts={len(prompts)} images={sample_count}"
             )
 
         prompt_hashes = [prompt_sha256(prompt) for prompt in prompts]
@@ -227,29 +372,54 @@ class WDEVA02PromptHashService:
             )
 
         LOGGER.info(
-            "WD compute request: samples=%s data_parallel=%s active_gpus=%s",
-            len(images),
-            self.encoder.data_parallel_enabled,
-            len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
+            "WD compute request: samples=%s ddp=%s active_gpus=%s",
+            sample_count,
+            self.ddp_enabled,
+            len(self.device_ids) if self.ddp_enabled else 1,
         )
         self._enter_compute()
         try:
-            generated_embeddings = self.encoder.encode_images(images)
+            if self.ddp_enabled:
+                if self.ddp_pool is None:
+                    raise RuntimeError("DDP worker pool is not initialized.")
+                rewards = self.ddp_pool.compute(
+                    payload={
+                        "prompt": prompts,
+                        "image": image_payload,
+                        "video": video_payload,
+                    },
+                    total_size=sample_count,
+                )
+            else:
+                if self.encoder is None:
+                    raise RuntimeError("WD encoder is not initialized.")
+                images = _resolve_media_payload(
+                    image_payload=image_payload,
+                    video_payload=video_payload,
+                )
+                generated_embeddings = self.encoder.encode_images(images)
+
+                reference_embeddings = torch.stack(
+                    [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+                )
+                rewards_tensor = (generated_embeddings * reference_embeddings).sum(dim=-1)
+                rewards = rewards_tensor.float().tolist()
         finally:
             self._exit_compute()
 
-        reference_embeddings = torch.stack(
-            [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
-        )
-        rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
         LOGGER.info(
-            "WD compute complete: samples=%s data_parallel=%s active_gpus=%s elapsed_s=%.3f",
-            len(images),
-            self.encoder.data_parallel_enabled,
-            len(self.encoder.device_ids) if self.encoder.data_parallel_enabled else 1,
+            "WD compute complete: samples=%s ddp=%s active_gpus=%s elapsed_s=%.3f",
+            sample_count,
+            self.ddp_enabled,
+            len(self.device_ids) if self.ddp_enabled else 1,
             time.perf_counter() - start_time,
         )
-        return rewards.float().tolist()
+        return rewards
+
+    def close(self) -> None:
+        """Release server resources."""
+        with self._condition:
+            self._offload_to_cpu_locked()
 
 
 class RewardRequestHandler(BaseHTTPRequestHandler):
@@ -274,13 +444,11 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "reference_count": len(self.service.reference_embeddings),
                     "cache_path": str(self.service.cache_path),
-                    "data_parallel": self.service.encoder.data_parallel_enabled,
-                    "active_gpus": (
-                        len(self.service.encoder.device_ids)
-                        if self.service.encoder.data_parallel_enabled
-                        else 1
-                    ),
-                    "device_ids": self.service.encoder.device_ids,
+                    "ddp": self.service.ddp_enabled,
+                    "parallel_mode": "ddp" if self.service.ddp_enabled else "single",
+                    "active_gpus": len(self.service.device_ids) if self.service.ddp_enabled else 1,
+                    "device_ids": self.service.device_ids,
+                    "loaded": self.service._loaded_on_device,
                 }
             )
             return
@@ -345,7 +513,7 @@ def main() -> None:
         cache_path=args.cache_path,
         device=args.device,
         dtype=args.dtype,
-        disable_data_parallel=args.disable_data_parallel,
+        disable_ddp=args.disable_ddp,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)
@@ -360,6 +528,7 @@ def main() -> None:
     except KeyboardInterrupt:
         LOGGER.info("Stopping WD prompt-hash reward server.")
     finally:
+        RewardRequestHandler.service.close()
         server.server_close()
 
 
