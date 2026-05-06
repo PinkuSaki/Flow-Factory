@@ -96,7 +96,7 @@ try:
 except Exception:  # noqa: BLE001
     _install_torchvision_stub()
 
-from ddp_worker_pool import DDPWorkerPool
+from process_worker_pool import ProcessWorkerPool
 from transformers import AutoConfig, ViTForImageClassification, ViTImageProcessor
 
 LOGGER = logging.getLogger("shadow_server")
@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         "--disable-ddp",
         action="store_true",
         help=(
-            "Disable server-side DDP. By default, CUDA inference starts one "
+            "Disable server-side process parallelism. By default, CUDA inference starts one "
             "worker process per visible GPU when more than one GPU is available."
         ),
     )
@@ -191,8 +191,8 @@ def _count_media_payload(
     return len(video_payload)
 
 
-class AestheticShadowDDPWorker:
-    """DDP worker for one Aesthetic Shadow GPU rank."""
+class AestheticShadowProcessWorker:
+    """Process worker for one Aesthetic Shadow GPU rank."""
 
     def __init__(
         self,
@@ -217,12 +217,7 @@ class AestheticShadowDDPWorker:
         )
         model.to(device=self.device, dtype=self.dtype)
         model.eval()
-        self.inference_model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            broadcast_buffers=False,
-        )
+        self.inference_model = model
         self.inference_model.eval()
 
         label_to_id = getattr(model.config, "label2id", {}) or {}
@@ -236,7 +231,7 @@ class AestheticShadowDDPWorker:
         return nullcontext()
 
     def compute(self, payload: dict[str, Any]) -> list[float]:
-        """Compute one DDP rank shard."""
+        """Compute one process worker shard."""
         images = _resolve_media_payload(payload.get("image"), payload.get("video"))
         if not images:
             raise ValueError("At least one image or video input is required.")
@@ -277,9 +272,9 @@ class AestheticShadowService:
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.dtype_name = dtype if self.device.type == "cuda" else "float32"
         self.score_type = score_type
-        self.device_ids = self._resolve_ddp_device_ids(disable_ddp)
-        self.ddp_enabled = len(self.device_ids) > 1
-        self.ddp_pool: Optional[DDPWorkerPool] = None
+        self.device_ids = self._resolve_process_pool_device_ids(disable_ddp)
+        self.process_pool_enabled = len(self.device_ids) > 1
+        self.worker_pool: Optional[ProcessWorkerPool] = None
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
@@ -289,12 +284,12 @@ class AestheticShadowService:
         self.hq_index = int(label_to_id.get("hq", 0))
         self.lq_index = int(label_to_id.get("lq", 1 if self.hq_index == 0 else 0))
 
-        if self.ddp_enabled:
+        if self.process_pool_enabled:
             self.processor = None
             self.model = None
             self.inference_model = None
-            self.ddp_pool = DDPWorkerPool(
-                worker_factory=AestheticShadowDDPWorker,
+            self.worker_pool = ProcessWorkerPool(
+                worker_factory=AestheticShadowProcessWorker,
                 worker_kwargs={
                     "model_path": model_path,
                     "dtype": self.dtype_name,
@@ -315,11 +310,11 @@ class AestheticShadowService:
 
         LOGGER.info(
             "Aesthetic Shadow device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "ddp=%s device_ids=%s",
+            "process_pool=%s device_ids=%s",
             self.device,
             self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            self.ddp_enabled,
+            self.process_pool_enabled,
             self.device_ids,
         )
 
@@ -335,18 +330,18 @@ class AestheticShadowService:
 
         if not disable_ddp and torch.cuda.device_count() > 1 and resolved.index not in {None, 0}:
             raise ValueError(
-                "DDP shadow inference uses all visible CUDA devices and "
+                "Process-pool shadow inference uses all visible CUDA devices and "
                 "requires --device cuda or --device cuda:0. Use "
-                "--disable-ddp for a single indexed CUDA device."
+                "--disable-ddp for single-process inference on an indexed CUDA device."
             )
 
         return torch.device("cuda:0" if resolved.index is None else resolved)
 
-    def _resolve_ddp_device_ids(
+    def _resolve_process_pool_device_ids(
         self,
         disable_ddp: bool,
     ) -> list[int]:
-        """Return CUDA device ids used by DDP workers."""
+        """Return CUDA device ids used by process workers."""
         if self.device.type != "cuda" or disable_ddp:
             return []
 
@@ -364,10 +359,10 @@ class AestheticShadowService:
         """Move the model to its inference device while holding the condition."""
         if self._loaded_on_device:
             return
-        if self.ddp_enabled:
-            if self.ddp_pool is None:
-                raise RuntimeError("DDP worker pool is not initialized.")
-            self.ddp_pool.start()
+        if self.process_pool_enabled:
+            if self.worker_pool is None:
+                raise RuntimeError("Process worker pool is not initialized.")
+            self.worker_pool.start()
             self._loaded_on_device = True
             return
         if self.model is None:
@@ -388,9 +383,9 @@ class AestheticShadowService:
         """Move the model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
-        if self.ddp_enabled:
-            if self.ddp_pool is not None:
-                self.ddp_pool.shutdown()
+        if self.process_pool_enabled:
+            if self.worker_pool is not None:
+                self.worker_pool.shutdown()
             self._loaded_on_device = False
             return
         if self.model is None:
@@ -434,19 +429,19 @@ class AestheticShadowService:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Shadow compute request: samples=%s score_type=%s ddp=%s active_gpus=%s",
+            "Shadow compute request: samples=%s score_type=%s process_pool=%s active_gpus=%s",
             sample_count,
             self.score_type,
-            self.ddp_enabled,
-            len(self.device_ids) if self.ddp_enabled else 1,
+            self.process_pool_enabled,
+            len(self.device_ids) if self.process_pool_enabled else 1,
         )
 
         self._enter_compute()
         try:
-            if self.ddp_enabled:
-                if self.ddp_pool is None:
-                    raise RuntimeError("DDP worker pool is not initialized.")
-                rewards = self.ddp_pool.compute(
+            if self.process_pool_enabled:
+                if self.worker_pool is None:
+                    raise RuntimeError("Process worker pool is not initialized.")
+                rewards = self.worker_pool.compute(
                     payload={"image": image_payload, "video": video_payload},
                     total_size=sample_count,
                 )
@@ -471,10 +466,10 @@ class AestheticShadowService:
             self._exit_compute()
 
         LOGGER.info(
-            "Shadow compute complete: samples=%s ddp=%s active_gpus=%s elapsed_s=%.3f",
+            "Shadow compute complete: samples=%s process_pool=%s active_gpus=%s elapsed_s=%.3f",
             sample_count,
-            self.ddp_enabled,
-            len(self.device_ids) if self.ddp_enabled else 1,
+            self.process_pool_enabled,
+            len(self.device_ids) if self.process_pool_enabled else 1,
             time.perf_counter() - start_time,
         )
         return rewards
@@ -505,9 +500,13 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "status": "ok",
-                    "ddp": self.service.ddp_enabled,
-                    "parallel_mode": "ddp" if self.service.ddp_enabled else "single",
-                    "active_gpus": len(self.service.device_ids) if self.service.ddp_enabled else 1,
+                    "process_pool": self.service.process_pool_enabled,
+                    "parallel_mode": (
+                        "process_pool" if self.service.process_pool_enabled else "single"
+                    ),
+                    "active_gpus": (
+                        len(self.service.device_ids) if self.service.process_pool_enabled else 1
+                    ),
                     "device_ids": self.service.device_ids,
                     "loaded": self.service._loaded_on_device,
                 }

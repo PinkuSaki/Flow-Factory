@@ -42,6 +42,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from PIL import Image, ImageOps
+from process_worker_pool import ProcessWorkerPool
 from timm.models.swin_transformer_v2 import SwinTransformerV2
 
 LOGGER = logging.getLogger("anime_aesthetic_server")
@@ -90,8 +91,8 @@ def parse_args() -> argparse.Namespace:
         "--disable-data-parallel",
         action="store_true",
         help=(
-            "Disable torch.nn.DataParallel. By default, CUDA inference uses all "
-            "visible GPUs when more than one GPU is available."
+            "Disable server-side process parallelism. By default, CUDA inference starts one "
+            "worker process per visible GPU when more than one GPU is available."
         ),
     )
     parser.add_argument(
@@ -131,6 +132,23 @@ def _resolve_media_payload(
     return images
 
 
+def _count_media_payload(
+    image_payload: Optional[list[str]],
+    video_payload: Optional[list[list[str]]],
+) -> int:
+    """Count image or video samples without decoding image bytes."""
+    if image_payload:
+        return len(image_payload)
+
+    if not video_payload:
+        return 0
+
+    for frames in video_payload:
+        if not frames:
+            raise ValueError("Encountered an empty video payload.")
+    return len(video_payload)
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     """Load a JSON file."""
     return json.loads(path.read_text(encoding="utf-8"))
@@ -161,10 +179,12 @@ class AnimeAestheticService:
         self.model_path = Path(model_path).expanduser().resolve()
         self.device = self._resolve_device(device, disable_data_parallel)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
+        self.dtype_name = dtype if self.device.type == "cuda" else "float32"
         self.score_type = score_type
 
-        self.device_ids = self._resolve_data_parallel_device_ids(disable_data_parallel)
-        self.data_parallel_enabled = len(self.device_ids) > 1
+        self.device_ids = self._resolve_process_pool_device_ids(disable_data_parallel)
+        self.process_pool_enabled = len(self.device_ids) > 1
+        self.worker_pool: Optional[ProcessWorkerPool] = None
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded_on_device = False
@@ -173,9 +193,8 @@ class AnimeAestheticService:
         self.labels = [str(label) for label in self.meta["labels"]]
         self.label_to_index = {label: index for index, label in enumerate(self.labels)}
         self.image_size = int(self.meta.get("img_size", 448))
-        self.model = self._load_model()
-        self.model.eval()
-        self.inference_model: torch.nn.Module = self.model
+        self.model: Optional[torch.nn.Module] = None
+        self.inference_model: Optional[torch.nn.Module] = None
 
         self.score_weights = torch.tensor(
             [float(LABEL_QUALITY_ORDER.index(label)) for label in self.labels],
@@ -185,13 +204,30 @@ class AnimeAestheticService:
         self.masterpiece_index = self.label_to_index["masterpiece"]
         self.percentile_x, self.percentile_y = self._load_percentile_samples()
 
+        if self.process_pool_enabled:
+            self.worker_pool = ProcessWorkerPool(
+                worker_factory=AnimeAestheticProcessWorker,
+                worker_kwargs={
+                    "model_path": self.model_path,
+                    "dtype": self.dtype_name,
+                    "score_type": score_type,
+                },
+                world_size=len(self.device_ids),
+                batch_keys=("image", "video"),
+                logger=LOGGER,
+            )
+        else:
+            self.model = self._load_model()
+            self.model.eval()
+            self.inference_model = self.model
+
         LOGGER.info(
             "Anime aesthetic device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "data_parallel=%s device_ids=%s score_type=%s",
+            "process_pool=%s device_ids=%s score_type=%s",
             self.device,
             self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            self.data_parallel_enabled,
+            self.process_pool_enabled,
             self.device_ids,
             self.score_type,
         )
@@ -212,18 +248,18 @@ class AnimeAestheticService:
             and resolved.index not in {None, 0}
         ):
             raise ValueError(
-                "Data-parallel anime aesthetic inference uses all visible CUDA devices and "
+                "Process-pool anime aesthetic inference uses all visible CUDA devices and "
                 "requires --device cuda or --device cuda:0. Use "
-                "--disable-data-parallel for a single indexed CUDA device."
+                "--disable-data-parallel for single-process inference on an indexed CUDA device."
             )
 
         return torch.device("cuda:0" if resolved.index is None else resolved)
 
-    def _resolve_data_parallel_device_ids(
+    def _resolve_process_pool_device_ids(
         self,
         disable_data_parallel: bool,
     ) -> list[int]:
-        """Return CUDA device ids used by torch.nn.DataParallel."""
+        """Return CUDA device ids used by process workers."""
         if self.device.type != "cuda" or disable_data_parallel:
             return []
 
@@ -287,17 +323,17 @@ class AnimeAestheticService:
         """Move the model to its inference device while holding the condition."""
         if self._loaded_on_device:
             return
+        if self.process_pool_enabled:
+            if self.worker_pool is None:
+                raise RuntimeError("Process worker pool is not initialized.")
+            self.worker_pool.start()
+            self._loaded_on_device = True
+            return
+        if self.model is None:
+            raise RuntimeError("Anime aesthetic model is not initialized.")
         self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
-        if self.data_parallel_enabled:
-            self.inference_model = torch.nn.DataParallel(
-                self.model,
-                device_ids=self.device_ids,
-                output_device=self.device_ids[0],
-            )
-            self.inference_model.eval()
-        else:
-            self.inference_model = self.model
+        self.inference_model = self.model
         self._loaded_on_device = True
 
     def offload_to_cpu(self) -> None:
@@ -311,6 +347,13 @@ class AnimeAestheticService:
         """Move the model to CPU while holding the condition."""
         if not self._loaded_on_device:
             return
+        if self.process_pool_enabled:
+            if self.worker_pool is not None:
+                self.worker_pool.shutdown()
+            self._loaded_on_device = False
+            return
+        if self.model is None:
+            raise RuntimeError("Anime aesthetic model is not initialized.")
         self.inference_model = self.model
         self.model.to("cpu")
         self.model.eval()
@@ -385,47 +428,97 @@ class AnimeAestheticService:
     ) -> list[float]:
         """Compute rewards for a batch of images or videos."""
         start_time = time.perf_counter()
-        images = _resolve_media_payload(image_payload, video_payload)
-        if not images:
+        sample_count = _count_media_payload(image_payload, video_payload)
+        if sample_count <= 0:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Anime aesthetic compute request: samples=%s score_type=%s data_parallel=%s "
+            "Anime aesthetic compute request: samples=%s score_type=%s process_pool=%s "
             "active_gpus=%s",
-            len(images),
+            sample_count,
             self.score_type,
-            self.data_parallel_enabled,
-            len(self.device_ids) if self.data_parallel_enabled else 1,
+            self.process_pool_enabled,
+            len(self.device_ids) if self.process_pool_enabled else 1,
         )
 
         rewards: list[float] = []
         self._enter_compute()
         try:
-            with torch.inference_mode():
-                batch = self._preprocess_images(images).to(
-                    device=self.device,
-                    dtype=self.dtype,
+            if self.process_pool_enabled:
+                if self.worker_pool is None:
+                    raise RuntimeError("Process worker pool is not initialized.")
+                rewards = self.worker_pool.compute(
+                    payload={"image": image_payload, "video": video_payload},
+                    total_size=sample_count,
                 )
+            else:
+                if self.inference_model is None:
+                    raise RuntimeError("Anime aesthetic model is not initialized.")
+                images = _resolve_media_payload(image_payload, video_payload)
+                with torch.inference_mode():
+                    batch = self._preprocess_images(images).to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
 
-                with self._get_autocast_context():
-                    logits = self.inference_model(batch)
+                    with self._get_autocast_context():
+                        logits = self.inference_model(batch)
 
-                if isinstance(logits, (tuple, list)):
-                    logits = logits[0]
-                probabilities = logits.float().softmax(dim=-1)
-                rewards = self._score_probabilities(probabilities).detach().cpu().float().tolist()
+                    if isinstance(logits, (tuple, list)):
+                        logits = logits[0]
+                    probabilities = logits.float().softmax(dim=-1)
+                    rewards = (
+                        self._score_probabilities(probabilities).detach().cpu().float().tolist()
+                    )
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "Anime aesthetic compute complete: samples=%s data_parallel=%s "
+            "Anime aesthetic compute complete: samples=%s process_pool=%s "
             "active_gpus=%s elapsed_s=%.3f",
-            len(images),
-            self.data_parallel_enabled,
-            len(self.device_ids) if self.data_parallel_enabled else 1,
+            sample_count,
+            self.process_pool_enabled,
+            len(self.device_ids) if self.process_pool_enabled else 1,
             time.perf_counter() - start_time,
         )
         return rewards
+
+    def close(self) -> None:
+        """Release server resources."""
+        with self._condition:
+            self._offload_to_cpu_locked()
+
+
+class AnimeAestheticProcessWorker:
+    """Process worker for one anime aesthetic GPU rank."""
+
+    def __init__(
+        self,
+        *,
+        local_rank: int,
+        world_size: int,
+        model_path: Path,
+        dtype: str,
+        score_type: str,
+    ) -> None:
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.service = AnimeAestheticService(
+            model_path=model_path,
+            device=f"cuda:{local_rank}",
+            dtype=dtype,
+            score_type=score_type,
+            disable_data_parallel=True,
+        )
+        self.service.ensure_on_device()
+
+    def compute(self, payload: dict[str, Any]) -> list[float]:
+        """Compute one process worker shard."""
+        return self.service.compute_rewards(payload.get("image"), payload.get("video"))
+
+    def close(self) -> None:
+        """Release CUDA memory held by this worker."""
+        self.service.close()
 
 
 class RewardRequestHandler(BaseHTTPRequestHandler):
@@ -452,9 +545,12 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "score_type": self.service.score_type,
                     "labels": self.service.labels,
                     "image_size": self.service.image_size,
-                    "data_parallel": self.service.data_parallel_enabled,
+                    "process_pool": self.service.process_pool_enabled,
+                    "parallel_mode": (
+                        "process_pool" if self.service.process_pool_enabled else "single"
+                    ),
                     "active_gpus": (
-                        len(self.service.device_ids) if self.service.data_parallel_enabled else 1
+                        len(self.service.device_ids) if self.service.process_pool_enabled else 1
                     ),
                     "device_ids": self.service.device_ids,
                 }
@@ -535,6 +631,7 @@ def main() -> None:
     except KeyboardInterrupt:
         LOGGER.info("Stopping anime aesthetic reward server.")
     finally:
+        RewardRequestHandler.service.close()
         server.server_close()
 
 
