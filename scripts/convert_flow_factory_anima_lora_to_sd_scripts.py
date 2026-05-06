@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -27,21 +28,105 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from flow_factory.utils.anima_lora_conversion import (  # noqa: E402
+    ConversionSummary,
     convert_flow_factory_anima_lora,
     describe_summary,
 )
+
+ADAPTER_WEIGHTS_CANDIDATES = ("adapter_model.safetensors", "adapter_model.bin")
+
+
+def _has_adapter_weights(directory: Path) -> bool:
+    """Return whether a directory contains PEFT adapter weights."""
+    return any((directory / filename).exists() for filename in ADAPTER_WEIGHTS_CANDIDATES)
+
+
+def _checkpoint_sort_key(path: Path) -> list[int | str]:
+    """Sort checkpoint paths naturally, e.g. checkpoint-2 before checkpoint-10."""
+    parts = re.split(r"(\d+)", path.name)
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
+def _discover_checkpoint_dirs(input_path: Path) -> list[Path]:
+    """Discover direct checkpoint subdirectories that contain adapter weights."""
+    if not input_path.is_dir():
+        return []
+    return sorted(
+        (
+            child
+            for child in input_path.glob("checkpoint-*")
+            if child.is_dir() and _has_adapter_weights(child)
+        ),
+        key=_checkpoint_sort_key,
+    )
+
+
+def _should_batch_convert(input_path: Path, checkpoint_dirs: list[Path]) -> bool:
+    """Return whether the input path should be treated as a checkpoint collection."""
+    if not checkpoint_dirs:
+        return False
+    if _has_adapter_weights(input_path):
+        return False
+    if any(
+        _has_adapter_weights(input_path / component)
+        for component in ("transformer", "text_encoder")
+    ):
+        return False
+    return input_path.name == "checkpoints" or len(checkpoint_dirs) > 1
+
+
+def _convert_checkpoint_collection(
+    checkpoint_dirs: list[Path],
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> list[ConversionSummary]:
+    """Convert every checkpoint directory into one sd-scripts safetensors file."""
+    if output_dir.suffix == ".safetensors":
+        raise ValueError(
+            "Batch checkpoint conversion requires output_path to be a directory, "
+            "not a .safetensors file."
+        )
+    if output_dir.exists() and not output_dir.is_dir():
+        raise FileExistsError(f"Batch output path exists and is not a directory: {output_dir}")
+
+    summaries: list[ConversionSummary] = []
+    for checkpoint_dir in checkpoint_dirs:
+        output_path = output_dir / f"{checkpoint_dir.name}.safetensors"
+        summary = convert_flow_factory_anima_lora(
+            input_path=checkpoint_dir,
+            output_path=output_path,
+            component_arg=args.component_type,
+            save_dtype_name=args.save_dtype,
+            default_alpha=args.default_alpha,
+            overwrite=args.overwrite,
+        )
+        summaries.append(summary)
+        print(describe_summary(summary))
+    return summaries
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Convert a Flow-Factory Anima LoRA checkpoint directory into a single "
-            "sd-scripts-compatible .safetensors file."
+            "Convert Flow-Factory Anima LoRA checkpoint directories into "
+            "sd-scripts-compatible .safetensors files."
         )
     )
-    parser.add_argument("input_path", help="Flow-Factory LoRA directory, component directory, or adapter file.")
-    parser.add_argument("output_path", help="Destination .safetensors file for sd-scripts.")
+    parser.add_argument(
+        "input_path",
+        help=(
+            "Flow-Factory LoRA directory, component directory, adapter file, or a "
+            "directory containing checkpoint-* subdirectories."
+        ),
+    )
+    parser.add_argument(
+        "output_path",
+        help=(
+            "Destination .safetensors file for single-checkpoint conversion, or "
+            "destination directory for checkpoint collection conversion."
+        ),
+    )
     parser.add_argument(
         "--component-type",
         choices=["auto", "transformer", "text_encoder"],
@@ -73,9 +158,21 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    input_path = Path(args.input_path).expanduser().resolve()
+    output_path = Path(args.output_path).expanduser().resolve()
+    checkpoint_dirs = _discover_checkpoint_dirs(input_path)
+    if _should_batch_convert(input_path, checkpoint_dirs):
+        summaries = _convert_checkpoint_collection(
+            checkpoint_dirs=checkpoint_dirs,
+            output_dir=output_path,
+            args=args,
+        )
+        print(f"Converted {len(summaries)} checkpoints into {output_path}.")
+        return 0
+
     summary = convert_flow_factory_anima_lora(
-        input_path=args.input_path,
-        output_path=args.output_path,
+        input_path=input_path,
+        output_path=output_path,
         component_arg=args.component_type,
         save_dtype_name=args.save_dtype,
         default_alpha=args.default_alpha,
