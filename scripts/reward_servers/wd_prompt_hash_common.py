@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,6 +27,33 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+
+
+@dataclass(frozen=True)
+class WDReferenceCache:
+    """Prompt-hash indexed WD reference features loaded from a torch cache."""
+
+    prompt_hashes: list[str]
+    embeddings: dict[str, torch.Tensor]
+    probabilities: Optional[dict[str, torch.Tensor]] = None
+
+    def require_probabilities(self) -> dict[str, torch.Tensor]:
+        """Return reference probabilities or fail with a rebuild hint."""
+        if self.probabilities is None:
+            raise ValueError(
+                "The WD reference cache does not contain probability vectors. "
+                "Rebuild it with build_wd_prompt_hash_cache.py before using "
+                "probability-based WD score types."
+            )
+        return self.probabilities
+
+
+@dataclass(frozen=True)
+class WDImageOutputs:
+    """WD image embedding and class-probability outputs."""
+
+    embeddings: torch.Tensor
+    probabilities: torch.Tensor
 
 
 def prompt_sha256(prompt: str) -> str:
@@ -69,10 +97,10 @@ def resolve_reference_image_path(
     raise FileNotFoundError(f"Reference image not found for {raw_path!r}. Tried: {attempted}")
 
 
-def load_reference_cache(cache_path: Path) -> dict[str, torch.Tensor]:
-    """Load a prompt-hash reference embedding cache."""
+def load_reference_cache_payload(cache_path: Path) -> WDReferenceCache:
+    """Load a prompt-hash reference cache payload."""
     if not cache_path.exists():
-        raise FileNotFoundError(f"Reference embedding cache does not exist: {cache_path}")
+        raise FileNotFoundError(f"Reference cache does not exist: {cache_path}")
 
     try:
         payload = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -87,21 +115,96 @@ def load_reference_cache(cache_path: Path) -> dict[str, torch.Tensor]:
                 f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
                 f"embeddings rows ({embeddings.shape[0]})."
             )
-        return {
-            str(prompt_hash): embeddings[index].detach().cpu()
-            for index, prompt_hash in enumerate(prompt_hashes)
-        }
+        probabilities = None
+        if "probabilities" in payload:
+            probability_tensor = torch.as_tensor(payload["probabilities"], dtype=torch.float32)
+            if len(prompt_hashes) != probability_tensor.shape[0]:
+                raise ValueError(
+                    f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
+                    f"probabilities rows ({probability_tensor.shape[0]})."
+                )
+            probabilities = {
+                str(prompt_hash): probability_tensor[index].detach().cpu()
+                for index, prompt_hash in enumerate(prompt_hashes)
+            }
+
+        return WDReferenceCache(
+            prompt_hashes=[str(prompt_hash) for prompt_hash in prompt_hashes],
+            embeddings={
+                str(prompt_hash): embeddings[index].detach().cpu()
+                for index, prompt_hash in enumerate(prompt_hashes)
+            },
+            probabilities=probabilities,
+        )
 
     if isinstance(payload, dict):
-        return {
-            str(prompt_hash): torch.as_tensor(embedding, dtype=torch.float32).detach().cpu()
-            for prompt_hash, embedding in payload.items()
-        }
+        prompt_hashes = [str(prompt_hash) for prompt_hash in payload.keys()]
+        return WDReferenceCache(
+            prompt_hashes=prompt_hashes,
+            embeddings={
+                str(prompt_hash): torch.as_tensor(embedding, dtype=torch.float32).detach().cpu()
+                for prompt_hash, embedding in payload.items()
+            },
+        )
 
     raise ValueError(
         "Unsupported reference cache format. Expected either "
-        "{'prompt_hashes': [...], 'embeddings': Tensor} or {hash: embedding}."
+        "{'prompt_hashes': [...], 'embeddings': Tensor, 'probabilities': Tensor} or "
+        "{hash: embedding}."
     )
+
+
+def load_reference_cache(cache_path: Path) -> dict[str, torch.Tensor]:
+    """Load prompt-hash reference embeddings from a cache."""
+    return load_reference_cache_payload(cache_path).embeddings
+
+
+def soft_jaccard_score(
+    generated_probabilities: torch.Tensor,
+    reference_probabilities: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compute soft Jaccard similarity between two probability vectors."""
+    if generated_probabilities.shape != reference_probabilities.shape:
+        raise ValueError(
+            "Probability shape mismatch: "
+            f"generated={tuple(generated_probabilities.shape)} "
+            f"reference={tuple(reference_probabilities.shape)}"
+        )
+
+    intersection = torch.minimum(generated_probabilities, reference_probabilities).sum(dim=-1)
+    union = torch.maximum(generated_probabilities, reference_probabilities).sum(dim=-1)
+    return intersection / union.clamp_min(eps)
+
+
+def wd_distribution_reward(
+    real_probabilities: torch.Tensor,
+    fake_probabilities: torch.Tensor,
+    recall_gamma: float = 1.5,
+    jaccard_gamma: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute WD probability-distribution reward with recall and soft Jaccard terms."""
+    if real_probabilities.shape != fake_probabilities.shape:
+        raise ValueError(
+            "Probability shape mismatch: "
+            f"real={tuple(real_probabilities.shape)} fake={tuple(fake_probabilities.shape)}"
+        )
+
+    minimum_probabilities = torch.minimum(real_probabilities, fake_probabilities)
+    maximum_probabilities = torch.maximum(real_probabilities, fake_probabilities)
+
+    recall_weights = real_probabilities.pow(recall_gamma)
+    recall = (recall_weights * minimum_probabilities).sum(dim=-1) / (
+        (recall_weights * real_probabilities).sum(dim=-1) + eps
+    )
+
+    jaccard_weights = maximum_probabilities.pow(jaccard_gamma)
+    jaccard = (jaccard_weights * minimum_probabilities).sum(dim=-1) / (
+        (jaccard_weights * maximum_probabilities).sum(dim=-1) + eps
+    )
+
+    return 0.7 * recall + 0.3 * jaccard
 
 
 def save_reference_cache(
@@ -109,19 +212,22 @@ def save_reference_cache(
     prompt_hashes: list[str],
     reference_embeddings: dict[str, torch.Tensor],
     metadata: dict[str, Any],
+    reference_probabilities: Optional[dict[str, torch.Tensor]] = None,
 ) -> None:
-    """Save prompt-hash reference embeddings to a torch cache."""
+    """Save prompt-hash reference embeddings and optional probabilities to a torch cache."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "prompt_hashes": prompt_hashes,
-            "embeddings": torch.stack(
-                [reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
-            ),
-            **metadata,
-        },
-        cache_path,
-    )
+    payload: dict[str, Any] = {
+        "prompt_hashes": prompt_hashes,
+        "embeddings": torch.stack(
+            [reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+        ),
+        **metadata,
+    }
+    if reference_probabilities is not None:
+        payload["probabilities"] = torch.stack(
+            [reference_probabilities[prompt_hash] for prompt_hash in prompt_hashes]
+        )
+    torch.save(payload, cache_path)
 
 
 def _load_model_config(model_path: Path) -> dict[str, Any]:
@@ -167,8 +273,8 @@ class WDEVA02EmbeddingModel:
         self.image_std = tuple(float(value) for value in pretrained_cfg.get("std", [0.5, 0.5, 0.5]))
 
         self.model = self._load_wd_model()
-        self.feature_model = WDEVA02FeatureExtractor(self.model)
-        self.inference_model: torch.nn.Module = self.feature_model
+        self.output_model = WDEVA02OutputExtractor(self.model)
+        self.inference_model: torch.nn.Module = self.output_model
 
     @staticmethod
     def _resolve_device(device: str) -> torch.device:
@@ -206,15 +312,15 @@ class WDEVA02EmbeddingModel:
 
     def ensure_on_device(self) -> None:
         """Move the WD model to its inference device."""
-        self.feature_model.to(device=self.device, dtype=self.dtype)
-        self.feature_model.eval()
-        self.inference_model = self.feature_model
+        self.output_model.to(device=self.device, dtype=self.dtype)
+        self.output_model.eval()
+        self.inference_model = self.output_model
 
     def wrap_ddp(self, local_rank: int) -> None:
-        """Wrap the WD feature extractor with DistributedDataParallel."""
+        """Wrap the WD output extractor with DistributedDataParallel."""
         self.ensure_on_device()
         self.inference_model = torch.nn.parallel.DistributedDataParallel(
-            self.feature_model,
+            self.output_model,
             device_ids=[local_rank],
             output_device=local_rank,
             broadcast_buffers=False,
@@ -223,9 +329,9 @@ class WDEVA02EmbeddingModel:
 
     def offload_to_cpu(self) -> None:
         """Move the WD model to CPU and release CUDA cache when applicable."""
-        self.inference_model = self.feature_model
-        self.feature_model.to("cpu")
-        self.feature_model.eval()
+        self.inference_model = self.output_model
+        self.output_model.to("cpu")
+        self.output_model.eval()
         if self.device.type == "cuda":
             with torch.cuda.device(self.device.index or 0):
                 torch.cuda.empty_cache()
@@ -252,9 +358,10 @@ class WDEVA02EmbeddingModel:
         return torch.stack(tensors, dim=0)
 
     @torch.inference_mode()
-    def encode_images(self, images: list[Image.Image]) -> torch.Tensor:
-        """Extract normalized WD image embeddings."""
+    def encode_image_outputs(self, images: list[Image.Image]) -> WDImageOutputs:
+        """Extract normalized WD image embeddings and class probabilities."""
         embeddings = []
+        probabilities = []
         batch_size = self.max_batch_size or len(images)
         for start in range(0, len(images), batch_size):
             batch_images = images[start : start + batch_size]
@@ -264,15 +371,24 @@ class WDEVA02EmbeddingModel:
             )
 
             with self._get_autocast_context():
-                features = self.inference_model(batch)
+                features, logits = self.inference_model(batch)
 
             embeddings.append(F.normalize(features.float(), dim=-1).cpu())
+            probabilities.append(torch.sigmoid(logits.float()).cpu())
 
-        return torch.cat(embeddings, dim=0)
+        return WDImageOutputs(
+            embeddings=torch.cat(embeddings, dim=0),
+            probabilities=torch.cat(probabilities, dim=0),
+        )
+
+    @torch.inference_mode()
+    def encode_images(self, images: list[Image.Image]) -> torch.Tensor:
+        """Extract normalized WD image embeddings."""
+        return self.encode_image_outputs(images).embeddings
 
 
-class WDEVA02FeatureExtractor(torch.nn.Module):
-    """Expose WD feature extraction through a regular forward method."""
+class WDEVA02OutputExtractor(torch.nn.Module):
+    """Expose WD embedding and classifier outputs through a regular forward method."""
 
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__()
@@ -289,24 +405,44 @@ class WDEVA02FeatureExtractor(torch.nn.Module):
             return features
         raise ValueError(f"Unsupported WD feature shape: {tuple(features.shape)}")
 
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        """Extract one batch of WD features."""
+    def _forward_head(self, features: torch.Tensor, *, pre_logits: bool) -> torch.Tensor:
+        """Run the timm model head while preserving feature fallback behavior."""
+        if not hasattr(self.model, "forward_head"):
+            return self._pool_features(features)
+
+        try:
+            return self.model.forward_head(features, pre_logits=pre_logits)
+        except TypeError:
+            if pre_logits:
+                return self._pool_features(features)
+            return self.model.forward_head(features)
+
+    def forward(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract one batch of WD embeddings and logits."""
         if hasattr(self.model, "forward_features"):
-            features = self.model.forward_features(batch)
-            if hasattr(self.model, "forward_head"):
-                try:
-                    features = self.model.forward_head(features, pre_logits=True)
-                except TypeError:
-                    features = self.model.forward_head(features)
-            else:
-                features = self._pool_features(features)
+            raw_features = self.model.forward_features(batch)
+            if isinstance(raw_features, (tuple, list)):
+                raw_features = raw_features[0]
+            if not isinstance(raw_features, torch.Tensor):
+                raise TypeError(
+                    f"Expected WD features to be a tensor, got {type(raw_features).__name__}."
+                )
+            features = self._forward_head(raw_features, pre_logits=True)
+            logits = self._forward_head(raw_features, pre_logits=False)
         else:
-            features = self.model(batch)
+            logits = self.model(batch)
+            features = logits
 
         if isinstance(features, (tuple, list)):
             features = features[0]
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
         if not isinstance(features, torch.Tensor):
             raise TypeError(f"Expected WD features to be a tensor, got {type(features).__name__}.")
+        if not isinstance(logits, torch.Tensor):
+            raise TypeError(f"Expected WD logits to be a tensor, got {type(logits).__name__}.")
         if features.ndim != 2:
             features = self._pool_features(features)
-        return features
+        if logits.ndim != 2:
+            logits = self._pool_features(logits)
+        return features, logits

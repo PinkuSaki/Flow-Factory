@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a WD EVA02 prompt-hash reference embedding cache.
+"""Build a WD EVA02 prompt-hash reference cache.
 
 This script is intended to run before training. The training-time reward server
 loads the resulting cache and never reads reference images.
@@ -26,7 +26,6 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
     prompt_sha256,
@@ -34,7 +33,6 @@ from wd_prompt_hash_common import (
     resolve_reference_image_path,
     save_reference_cache,
 )
-
 
 LOGGER = logging.getLogger("build_wd_prompt_hash_cache")
 
@@ -74,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--cache-path",
         type=Path,
         required=True,
-        help="Destination torch cache path for prompt-hash reference embeddings.",
+        help="Destination torch cache path for prompt-hash reference features.",
     )
     parser.add_argument(
         "--overwrite",
@@ -148,7 +146,7 @@ def _build_hash_to_path(
 
 
 def build_cache(args: argparse.Namespace) -> None:
-    """Build and save the reference embedding cache."""
+    """Build and save the reference feature cache."""
     if args.cache_path.exists() and not args.overwrite:
         raise FileExistsError(
             f"Cache already exists: {args.cache_path}. Pass --overwrite to replace it."
@@ -162,6 +160,7 @@ def build_cache(args: argparse.Namespace) -> None:
     )
     prompt_hashes = list(hash_to_path.keys())
     reference_embeddings: dict[str, torch.Tensor] = {}
+    reference_probabilities: dict[str, torch.Tensor] = {}
 
     encoder = WDEVA02EmbeddingModel(
         model_path=args.model_path,
@@ -172,7 +171,7 @@ def build_cache(args: argparse.Namespace) -> None:
     encoder.ensure_on_device()
 
     LOGGER.info(
-        "Building %s WD reference embeddings from %s",
+        "Building %s WD reference embeddings and probabilities from %s",
         len(prompt_hashes),
         args.reference_jsonl,
     )
@@ -183,22 +182,30 @@ def build_cache(args: argparse.Namespace) -> None:
             with Image.open(hash_to_path[prompt_hash]) as image:
                 batch_images.append(image.convert("RGB"))
 
-        batch_embeddings = encoder.encode_images(batch_images)
-        for prompt_hash, embedding in zip(batch_hashes, batch_embeddings):
+        batch_outputs = encoder.encode_image_outputs(batch_images)
+        for prompt_hash, embedding, probabilities in zip(
+            batch_hashes,
+            batch_outputs.embeddings,
+            batch_outputs.probabilities,
+        ):
             reference_embeddings[prompt_hash] = embedding.detach().cpu()
+            reference_probabilities[prompt_hash] = probabilities.detach().cpu()
 
     save_reference_cache(
         cache_path=args.cache_path,
         prompt_hashes=prompt_hashes,
         reference_embeddings=reference_embeddings,
+        reference_probabilities=reference_probabilities,
         metadata={
             "prompt_field": args.prompt_field,
             "image_field": args.image_field,
             "model_path": str(args.model_path),
             "reference_jsonl": str(args.reference_jsonl),
+            "probability_activation": "sigmoid",
+            "cache_fields": ["embeddings", "probabilities"],
         },
     )
-    LOGGER.info("Saved WD reference embedding cache to %s", args.cache_path)
+    LOGGER.info("Saved WD reference cache to %s", args.cache_path)
 
 
 def main() -> None:

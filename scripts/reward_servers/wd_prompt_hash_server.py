@@ -20,9 +20,9 @@ The server exposes:
     - ``POST /offload`` -> move the WD model back to CPU
     - ``POST /compute`` -> ``{"rewards": [...]}``
 
-Reference embeddings must be built before training with
+Reference features must be built before training with
 ``build_wd_prompt_hash_cache.py``. This training-time server only loads the
-cache, hashes incoming prompts, encodes generated images, and returns cosine
+cache, hashes incoming prompts, encodes generated images, and returns WD
 similarity rewards.
 """
 
@@ -45,8 +45,10 @@ from PIL import Image
 from process_worker_pool import ProcessWorkerPool
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
-    load_reference_cache,
+    load_reference_cache_payload,
     prompt_sha256,
+    soft_jaccard_score,
+    wd_distribution_reward,
 )
 
 LOGGER = logging.getLogger("wd_prompt_hash_server")
@@ -67,7 +69,17 @@ def parse_args() -> argparse.Namespace:
         "--cache-path",
         type=Path,
         required=True,
-        help="Prebuilt prompt-hash reference embedding cache.",
+        help="Prebuilt prompt-hash reference feature cache.",
+    )
+    parser.add_argument(
+        "--score-type",
+        choices=("embedding_cosine", "soft_jaccard", "wd_distribution"),
+        default="embedding_cosine",
+        help=(
+            "Reward score to compute. embedding_cosine preserves the original normalized "
+            "feature cosine reward; soft_jaccard compares WD class probability vectors; "
+            "wd_distribution combines weighted recall and weighted soft Jaccard."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -152,10 +164,12 @@ class WDEVA02PromptHashProcessWorker:
         model_path: Path,
         cache_path: Path,
         dtype: str,
+        score_type: str,
     ) -> None:
         self.local_rank = local_rank
         self.world_size = world_size
-        self.reference_embeddings = load_reference_cache(cache_path)
+        self.score_type = score_type
+        self.reference_cache = load_reference_cache_payload(cache_path)
         self.encoder = WDEVA02EmbeddingModel(
             model_path=model_path,
             device=f"cuda:{local_rank}",
@@ -181,19 +195,40 @@ class WDEVA02PromptHashProcessWorker:
         missing_hashes = [
             prompt_hash
             for prompt_hash in prompt_hashes
-            if prompt_hash not in self.reference_embeddings
+            if prompt_hash not in self.reference_cache.embeddings
         ]
         if missing_hashes:
             raise KeyError(
-                f"Missing reference embeddings for {len(missing_hashes)} prompt hash(es), "
+                f"Missing reference data for {len(missing_hashes)} prompt hash(es), "
                 f"first missing hash: {missing_hashes[0]}"
             )
 
-        generated_embeddings = self.encoder.encode_images(images)
-        reference_embeddings = torch.stack(
-            [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
-        )
-        rewards = (generated_embeddings * reference_embeddings).sum(dim=-1)
+        generated_outputs = self.encoder.encode_image_outputs(images)
+        if self.score_type == "embedding_cosine":
+            reference_embeddings = torch.stack(
+                [self.reference_cache.embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = (generated_outputs.embeddings * reference_embeddings).sum(dim=-1)
+        elif self.score_type == "soft_jaccard":
+            reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+            reference_probabilities = torch.stack(
+                [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = soft_jaccard_score(
+                generated_outputs.probabilities,
+                reference_probabilities,
+            )
+        elif self.score_type == "wd_distribution":
+            reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+            reference_probabilities = torch.stack(
+                [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = wd_distribution_reward(
+                real_probabilities=reference_probabilities,
+                fake_probabilities=generated_outputs.probabilities,
+            )
+        else:
+            raise ValueError(f"Unsupported score_type: {self.score_type}")
         return rewards.float().tolist()
 
     def close(self) -> None:
@@ -211,9 +246,11 @@ class WDEVA02PromptHashService:
         device: str,
         dtype: str,
         disable_ddp: bool,
+        score_type: str,
     ) -> None:
         self.model_path = model_path
         self.cache_path = cache_path
+        self.score_type = score_type
         self.device = self._resolve_device(device, disable_ddp)
         self.dtype = getattr(torch, dtype) if self.device.type == "cuda" else torch.float32
         self.dtype_name = dtype if self.device.type == "cuda" else "float32"
@@ -224,7 +261,9 @@ class WDEVA02PromptHashService:
         self._active_compute_count = 0
         self._loaded_on_device = False
 
-        self.reference_embeddings = load_reference_cache(cache_path)
+        self.reference_cache = load_reference_cache_payload(cache_path)
+        if self.score_type in {"soft_jaccard", "wd_distribution"}:
+            self.reference_cache.require_probabilities()
         if self.process_pool_enabled:
             self.encoder: Optional[WDEVA02EmbeddingModel] = None
             self.worker_pool = ProcessWorkerPool(
@@ -233,6 +272,7 @@ class WDEVA02PromptHashService:
                     "model_path": model_path,
                     "cache_path": cache_path,
                     "dtype": self.dtype_name,
+                    "score_type": self.score_type,
                 },
                 world_size=len(self.device_ids),
                 batch_keys=("prompt", "image", "video"),
@@ -246,18 +286,19 @@ class WDEVA02PromptHashService:
             )
 
         LOGGER.info(
-            "Loaded %s WD reference embeddings from %s",
-            len(self.reference_embeddings),
+            "Loaded %s WD reference entries from %s",
+            len(self.reference_cache.embeddings),
             cache_path,
         )
         LOGGER.info(
             "WD prompt-hash device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "process_pool=%s device_ids=%s",
+            "process_pool=%s device_ids=%s score_type=%s",
             self.device,
             self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
             self.process_pool_enabled,
             self.device_ids,
+            self.score_type,
         )
 
     @staticmethod
@@ -348,7 +389,7 @@ class WDEVA02PromptHashService:
         image_payload: Optional[list[str]],
         video_payload: Optional[list[list[str]]],
     ) -> list[float]:
-        """Compute cosine similarity rewards for generated images."""
+        """Compute WD similarity rewards for generated images."""
         start_time = time.perf_counter()
         sample_count = _count_media_payload(
             image_payload=image_payload,
@@ -365,17 +406,18 @@ class WDEVA02PromptHashService:
         missing_hashes = [
             prompt_hash
             for prompt_hash in prompt_hashes
-            if prompt_hash not in self.reference_embeddings
+            if prompt_hash not in self.reference_cache.embeddings
         ]
         if missing_hashes:
             raise KeyError(
-                f"Missing reference embeddings for {len(missing_hashes)} prompt hash(es), "
+                f"Missing reference data for {len(missing_hashes)} prompt hash(es), "
                 f"first missing hash: {missing_hashes[0]}"
             )
 
         LOGGER.info(
-            "WD compute request: samples=%s process_pool=%s active_gpus=%s",
+            "WD compute request: samples=%s score_type=%s process_pool=%s active_gpus=%s",
             sample_count,
+            self.score_type,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
         )
@@ -399,19 +441,52 @@ class WDEVA02PromptHashService:
                     image_payload=image_payload,
                     video_payload=video_payload,
                 )
-                generated_embeddings = self.encoder.encode_images(images)
-
-                reference_embeddings = torch.stack(
-                    [self.reference_embeddings[prompt_hash] for prompt_hash in prompt_hashes]
-                )
-                rewards_tensor = (generated_embeddings * reference_embeddings).sum(dim=-1)
+                generated_outputs = self.encoder.encode_image_outputs(images)
+                if self.score_type == "embedding_cosine":
+                    reference_embeddings = torch.stack(
+                        [
+                            self.reference_cache.embeddings[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = (generated_outputs.embeddings * reference_embeddings).sum(
+                        dim=-1
+                    )
+                elif self.score_type == "soft_jaccard":
+                    reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+                    reference_probabilities = torch.stack(
+                        [
+                            reference_probabilities_by_hash[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = soft_jaccard_score(
+                        generated_outputs.probabilities,
+                        reference_probabilities,
+                    )
+                elif self.score_type == "wd_distribution":
+                    reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+                    reference_probabilities = torch.stack(
+                        [
+                            reference_probabilities_by_hash[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = wd_distribution_reward(
+                        real_probabilities=reference_probabilities,
+                        fake_probabilities=generated_outputs.probabilities,
+                    )
+                else:
+                    raise ValueError(f"Unsupported score_type: {self.score_type}")
                 rewards = rewards_tensor.float().tolist()
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "WD compute complete: samples=%s process_pool=%s active_gpus=%s elapsed_s=%.3f",
+            "WD compute complete: samples=%s score_type=%s process_pool=%s "
+            "active_gpus=%s elapsed_s=%.3f",
             sample_count,
+            self.score_type,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
             time.perf_counter() - start_time,
@@ -444,8 +519,12 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "status": "ok",
-                    "reference_count": len(self.service.reference_embeddings),
+                    "reference_count": len(self.service.reference_cache.embeddings),
                     "cache_path": str(self.service.cache_path),
+                    "score_type": self.service.score_type,
+                    "has_reference_probabilities": (
+                        self.service.reference_cache.probabilities is not None
+                    ),
                     "process_pool": self.service.process_pool_enabled,
                     "parallel_mode": (
                         "process_pool" if self.service.process_pool_enabled else "single"
@@ -520,14 +599,16 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         disable_ddp=args.disable_ddp,
+        score_type=args.score_type,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), RewardRequestHandler)
     LOGGER.info(
-        "Starting WD prompt-hash reward server on http://%s:%s using %s",
+        "Starting WD prompt-hash reward server on http://%s:%s using %s score_type=%s",
         args.host,
         args.port,
         args.model_path,
+        args.score_type,
     )
     try:
         server.serve_forever()
