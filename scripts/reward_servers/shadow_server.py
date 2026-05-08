@@ -21,7 +21,7 @@ The server exposes:
     - ``POST /compute`` -> ``{"rewards": [...]}``
 
 The request schema matches ``flow_factory.rewards.my_reward_remote``.
-Each reward is the average score across six deterministic augmented views.
+Each reward is the average score across the original image and six deterministic augmented views.
 """
 
 from __future__ import annotations
@@ -103,6 +103,7 @@ from transformers import AutoConfig, ViTForImageClassification, ViTImageProcesso
 
 LOGGER = logging.getLogger("shadow_server")
 VIEW_AUGMENTATION_COUNT = 6
+VIEW_SAMPLE_COUNT = 1 + VIEW_AUGMENTATION_COUNT
 BRIGHTNESS_UP_FACTOR = 1.15
 BRIGHTNESS_DOWN_FACTOR = 0.85
 CONTRAST_UP_FACTOR = 1.15
@@ -229,20 +230,22 @@ def _center_crop_and_resize(image: Image.Image, crop_ratio: float) -> Image.Imag
 
 
 def _build_view_augmented_images(images: list[Image.Image], view_index: int) -> list[Image.Image]:
-    """Build one deterministic augmented view for each input image."""
+    """Build one deterministic view for each input image."""
     if view_index == 0:
-        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_UP_FACTOR) for image in images]
+        return [image.copy() for image in images]
     if view_index == 1:
-        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_DOWN_FACTOR) for image in images]
+        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_UP_FACTOR) for image in images]
     if view_index == 2:
-        return [ImageEnhance.Contrast(image).enhance(CONTRAST_UP_FACTOR) for image in images]
+        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_DOWN_FACTOR) for image in images]
     if view_index == 3:
-        return [ImageEnhance.Contrast(image).enhance(CONTRAST_DOWN_FACTOR) for image in images]
+        return [ImageEnhance.Contrast(image).enhance(CONTRAST_UP_FACTOR) for image in images]
     if view_index == 4:
-        return [_darken_edges(image, EDGE_DARKEN_AMOUNT) for image in images]
+        return [ImageEnhance.Contrast(image).enhance(CONTRAST_DOWN_FACTOR) for image in images]
     if view_index == 5:
+        return [_darken_edges(image, EDGE_DARKEN_AMOUNT) for image in images]
+    if view_index == 6:
         return [_center_crop_and_resize(image, CENTER_CROP_RATIO) for image in images]
-    raise ValueError(f"Unsupported view augmentation index: {view_index}.")
+    raise ValueError(f"Unsupported view sample index: {view_index}.")
 
 
 def _score_shadow_logits(
@@ -269,10 +272,10 @@ def _compute_augmented_shadow_scores(
     hq_index: int,
     lq_index: int,
 ) -> list[float]:
-    """Score deterministic augmented views and average them per source image."""
+    """Score deterministic views and average them per source image."""
     score_sum: Optional[torch.Tensor] = None
 
-    for view_index in range(VIEW_AUGMENTATION_COUNT):
+    for view_index in range(VIEW_SAMPLE_COUNT):
         augmented_images = _build_view_augmented_images(images, view_index)
         inputs = processor(images=augmented_images, return_tensors="pt")
         inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -290,7 +293,7 @@ def _compute_augmented_shadow_scores(
 
     if score_sum is None:
         raise ValueError("At least one image or video input is required.")
-    averaged_scores = score_sum / float(VIEW_AUGMENTATION_COUNT)
+    averaged_scores = score_sum / float(VIEW_SAMPLE_COUNT)
     return averaged_scores.detach().cpu().float().tolist()
 
 
@@ -530,10 +533,11 @@ class AestheticShadowService:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Shadow compute request: samples=%s score_type=%s view_augmentations=%s "
-            "process_pool=%s active_gpus=%s",
+            "Shadow compute request: samples=%s score_type=%s view_samples=%s "
+            "view_augmentations=%s process_pool=%s active_gpus=%s",
             sample_count,
             self.score_type,
+            VIEW_SAMPLE_COUNT,
             VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
@@ -567,9 +571,10 @@ class AestheticShadowService:
             self._exit_compute()
 
         LOGGER.info(
-            "Shadow compute complete: samples=%s view_augmentations=%s process_pool=%s "
-            "active_gpus=%s elapsed_s=%.3f",
+            "Shadow compute complete: samples=%s view_samples=%s view_augmentations=%s "
+            "process_pool=%s active_gpus=%s elapsed_s=%.3f",
             sample_count,
+            VIEW_SAMPLE_COUNT,
             VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
@@ -612,7 +617,9 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     ),
                     "device_ids": self.service.device_ids,
                     "loaded": self.service._loaded_on_device,
+                    "view_samples": VIEW_SAMPLE_COUNT,
                     "view_augmentations": VIEW_AUGMENTATION_COUNT,
+                    "include_original_view": True,
                 }
             )
             return
