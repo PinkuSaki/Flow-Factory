@@ -21,6 +21,7 @@ The server exposes:
     - ``POST /compute`` -> ``{"rewards": [...]}``
 
 The request schema matches ``flow_factory.rewards.my_reward_remote``.
+Each reward is the average score across six deterministic augmented views.
 """
 
 from __future__ import annotations
@@ -40,10 +41,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 
 def _install_torchvision_stub() -> None:
@@ -100,6 +102,13 @@ from process_worker_pool import ProcessWorkerPool
 from transformers import AutoConfig, ViTForImageClassification, ViTImageProcessor
 
 LOGGER = logging.getLogger("shadow_server")
+VIEW_AUGMENTATION_COUNT = 6
+BRIGHTNESS_UP_FACTOR = 1.15
+BRIGHTNESS_DOWN_FACTOR = 0.85
+CONTRAST_UP_FACTOR = 1.15
+CONTRAST_DOWN_FACTOR = 0.85
+EDGE_DARKEN_AMOUNT = 0.30
+CENTER_CROP_RATIO = 0.85
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,6 +200,100 @@ def _count_media_payload(
     return len(video_payload)
 
 
+def _darken_edges(image: Image.Image, amount: float) -> Image.Image:
+    """Darken image edges with the transform visualizer's radial mask."""
+    if not 0 <= amount <= 1:
+        raise ValueError("Edge darken amount must be in the [0, 1] range.")
+    if amount == 0:
+        return image.copy()
+
+    width, height = image.size
+    y, x = np.ogrid[-1.0 : 1.0 : complex(height), -1.0 : 1.0 : complex(width)]
+    distance = np.sqrt(x * x + y * y)
+    distance = np.clip(distance / np.sqrt(2.0), 0.0, 1.0)
+    mask = 1.0 - amount * np.power(distance, 1.8)
+    array = np.asarray(image, dtype=np.float32)
+    darkened = np.clip(array * mask[..., None], 0, 255).astype(np.uint8)
+    return Image.fromarray(darkened, mode="RGB")
+
+
+def _center_crop_and_resize(image: Image.Image, crop_ratio: float) -> Image.Image:
+    """Center-crop an image and resize it back to the original dimensions."""
+    width, height = image.size
+    crop_width = max(1, int(round(width * crop_ratio)))
+    crop_height = max(1, int(round(height * crop_ratio)))
+    left = (width - crop_width) // 2
+    top = (height - crop_height) // 2
+    cropped = image.crop((left, top, left + crop_width, top + crop_height))
+    return cropped.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def _build_view_augmented_images(images: list[Image.Image], view_index: int) -> list[Image.Image]:
+    """Build one deterministic augmented view for each input image."""
+    if view_index == 0:
+        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_UP_FACTOR) for image in images]
+    if view_index == 1:
+        return [ImageEnhance.Brightness(image).enhance(BRIGHTNESS_DOWN_FACTOR) for image in images]
+    if view_index == 2:
+        return [ImageEnhance.Contrast(image).enhance(CONTRAST_UP_FACTOR) for image in images]
+    if view_index == 3:
+        return [ImageEnhance.Contrast(image).enhance(CONTRAST_DOWN_FACTOR) for image in images]
+    if view_index == 4:
+        return [_darken_edges(image, EDGE_DARKEN_AMOUNT) for image in images]
+    if view_index == 5:
+        return [_center_crop_and_resize(image, CENTER_CROP_RATIO) for image in images]
+    raise ValueError(f"Unsupported view augmentation index: {view_index}.")
+
+
+def _score_shadow_logits(
+    logits: torch.Tensor,
+    *,
+    score_type: str,
+    hq_index: int,
+    lq_index: int,
+) -> torch.Tensor:
+    """Convert shadow logits into one score per image."""
+    if score_type == "logit_margin":
+        return logits[:, hq_index] - logits[:, lq_index]
+    return logits.softmax(dim=-1)[:, hq_index]
+
+
+def _compute_augmented_shadow_scores(
+    *,
+    processor: ViTImageProcessor,
+    inference_model: torch.nn.Module,
+    images: list[Image.Image],
+    device: torch.device,
+    autocast_context_factory: Callable[[], Any],
+    score_type: str,
+    hq_index: int,
+    lq_index: int,
+) -> list[float]:
+    """Score deterministic augmented views and average them per source image."""
+    score_sum: Optional[torch.Tensor] = None
+
+    for view_index in range(VIEW_AUGMENTATION_COUNT):
+        augmented_images = _build_view_augmented_images(images, view_index)
+        inputs = processor(images=augmented_images, return_tensors="pt")
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with autocast_context_factory():
+            logits = inference_model(**inputs, return_dict=False)[0]
+
+        scores = _score_shadow_logits(
+            logits,
+            score_type=score_type,
+            hq_index=hq_index,
+            lq_index=lq_index,
+        ).float()
+        score_sum = scores if score_sum is None else score_sum + scores
+
+    if score_sum is None:
+        raise ValueError("At least one image or video input is required.")
+    averaged_scores = score_sum / float(VIEW_AUGMENTATION_COUNT)
+    return averaged_scores.detach().cpu().float().tolist()
+
+
 class AestheticShadowProcessWorker:
     """Process worker for one Aesthetic Shadow GPU rank."""
 
@@ -237,18 +340,16 @@ class AestheticShadowProcessWorker:
             raise ValueError("At least one image or video input is required.")
 
         with torch.inference_mode():
-            inputs = self.processor(images=images, return_tensors="pt")
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-
-            with self._get_autocast_context():
-                logits = self.inference_model(**inputs, return_dict=False)[0]
-
-            if self.score_type == "logit_margin":
-                scores = logits[:, self.hq_index] - logits[:, self.lq_index]
-            else:
-                scores = logits.softmax(dim=-1)[:, self.hq_index]
-
-            return scores.detach().cpu().float().tolist()
+            return _compute_augmented_shadow_scores(
+                processor=self.processor,
+                inference_model=self.inference_model,
+                images=images,
+                device=self.device,
+                autocast_context_factory=self._get_autocast_context,
+                score_type=self.score_type,
+                hq_index=self.hq_index,
+                lq_index=self.lq_index,
+            )
 
     def close(self) -> None:
         """Release CUDA memory held by this worker."""
@@ -429,9 +530,11 @@ class AestheticShadowService:
             raise ValueError("At least one image or video input is required.")
 
         LOGGER.info(
-            "Shadow compute request: samples=%s score_type=%s process_pool=%s active_gpus=%s",
+            "Shadow compute request: samples=%s score_type=%s view_augmentations=%s "
+            "process_pool=%s active_gpus=%s",
             sample_count,
             self.score_type,
+            VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
         )
@@ -450,24 +553,24 @@ class AestheticShadowService:
                     raise RuntimeError("Aesthetic Shadow model is not initialized.")
                 images = _resolve_media_payload(image_payload, video_payload)
                 with torch.inference_mode():
-                    inputs = self.processor(images=images, return_tensors="pt")
-                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
-
-                    with self._get_autocast_context():
-                        logits = self.inference_model(**inputs, return_dict=False)[0]
-
-                    if self.score_type == "logit_margin":
-                        scores = logits[:, self.hq_index] - logits[:, self.lq_index]
-                    else:
-                        scores = logits.softmax(dim=-1)[:, self.hq_index]
-
-                    rewards = scores.detach().cpu().float().tolist()
+                    rewards = _compute_augmented_shadow_scores(
+                        processor=self.processor,
+                        inference_model=self.inference_model,
+                        images=images,
+                        device=self.device,
+                        autocast_context_factory=self._get_autocast_context,
+                        score_type=self.score_type,
+                        hq_index=self.hq_index,
+                        lq_index=self.lq_index,
+                    )
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "Shadow compute complete: samples=%s process_pool=%s active_gpus=%s elapsed_s=%.3f",
+            "Shadow compute complete: samples=%s view_augmentations=%s process_pool=%s "
+            "active_gpus=%s elapsed_s=%.3f",
             sample_count,
+            VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
             time.perf_counter() - start_time,
@@ -509,6 +612,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     ),
                     "device_ids": self.service.device_ids,
                     "loaded": self.service._loaded_on_device,
+                    "view_augmentations": VIEW_AUGMENTATION_COUNT,
                 }
             )
             return
