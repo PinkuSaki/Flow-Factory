@@ -473,6 +473,59 @@ rewards:
     retry_attempts: 3    # optional, default 3
 ```
 
+### Prompt-Hash Wavelet Similarity Server
+
+For reference-image style or texture matching, Flow-Factory includes a lightweight
+Haar wavelet energy reward server. Build the prompt-hash reference cache before
+training:
+
+```bash
+python scripts/reward_servers/build_wavelet_prompt_hash_cache.py \
+  --reference-jsonl dataset/refs.jsonl \
+  --image-field source_image \
+  --cache-path caches/wavelet_refs.pt \
+  --image-size 512 \
+  --levels 4 \
+  --color-space y \
+  --overwrite
+```
+
+Then start the server:
+
+```bash
+python scripts/reward_servers/wavelet_prompt_hash_server.py \
+  --host 127.0.0.1 \
+  --port 18084 \
+  --cache-path caches/wavelet_refs.pt \
+  --score-type bhattacharyya \
+  --distribution-weight 0.8 \
+  --total-energy-tau 1.0 \
+  --num-workers 4
+```
+
+The server-side `--num-workers` controls CPU processes inside one `/compute`
+request. It is independent from the training config's `num_workers` and
+`remote_max_concurrent_requests`, which control request-level concurrency.
+
+Use it through the standard remote pointwise wrapper:
+
+```yaml
+rewards:
+  - name: "wavelet_reference_similarity"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    server_url: "http://127.0.0.1:18084"
+    batch_size: 128
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 8
+    remote_offload_after_compute: true
+    timeout: 300.0
+    retry_attempts: 1
+```
+
+This reward compares multi-level wavelet energy distributions and does not model
+semantic prompt alignment. Use it as an auxiliary signal together with semantic
+or aesthetic rewards.
+
 ### Server Dependencies
 
 The reward server runs in an **isolated environment**, separate from Flow-Factory.
