@@ -23,8 +23,7 @@ The server exposes:
 Reference features must be built before training with
 ``build_wd_prompt_hash_cache.py``. This training-time server only loads the
 cache, hashes incoming prompts, encodes generated images, and returns WD
-similarity rewards. Each reward is the minimum score across the original image
-and four deterministic transformed views.
+similarity rewards.
 """
 
 from __future__ import annotations
@@ -42,12 +41,10 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from PIL import Image, ImageFilter
+from PIL import Image
 from process_worker_pool import ProcessWorkerPool
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
-    WDImageOutputs,
-    WDReferenceCache,
     load_reference_cache_payload,
     prompt_sha256,
     soft_jaccard_score,
@@ -55,12 +52,6 @@ from wd_prompt_hash_common import (
 )
 
 LOGGER = logging.getLogger("wd_prompt_hash_server")
-VIEW_AUGMENTATION_COUNT = 4
-VIEW_SAMPLE_COUNT = 1 + VIEW_AUGMENTATION_COUNT
-RESIZE_075_SCALE = 0.75
-RESIZE_050_SCALE = 0.50
-GAUSSIAN_BLUR_RADIUS = 1.00
-JPEG_QUALITY = 70
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,106 +153,6 @@ def _count_media_payload(
     return len(video_payload)
 
 
-def _resize_roundtrip(image: Image.Image, scale: float) -> Image.Image:
-    """Resize down with Lanczos and resize back to the original dimensions."""
-    if scale <= 0:
-        raise ValueError(f"Resize scale must be positive, got {scale}.")
-    width, height = image.size
-    down_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-    down = image.resize(down_size, Image.Resampling.LANCZOS)
-    return down.resize((width, height), Image.Resampling.LANCZOS)
-
-
-def _jpeg_roundtrip(image: Image.Image, quality: int) -> Image.Image:
-    """Encode and decode an image as JPEG with the requested quality."""
-    if quality < 1 or quality > 100:
-        raise ValueError(f"JPEG quality must be in the [1, 100] range, got {quality}.")
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=quality, subsampling=0)
-    buffer.seek(0)
-    with Image.open(buffer) as compressed:
-        return compressed.convert("RGB")
-
-
-def _build_view_images(images: list[Image.Image], view_index: int) -> list[Image.Image]:
-    """Build one deterministic view for each input image."""
-    if view_index == 0:
-        return [image.copy() for image in images]
-    if view_index == 1:
-        return [_resize_roundtrip(image, RESIZE_075_SCALE) for image in images]
-    if view_index == 2:
-        return [_resize_roundtrip(image, RESIZE_050_SCALE) for image in images]
-    if view_index == 3:
-        return [
-            image.filter(ImageFilter.GaussianBlur(radius=GAUSSIAN_BLUR_RADIUS)) for image in images
-        ]
-    if view_index == 4:
-        return [_jpeg_roundtrip(image, JPEG_QUALITY) for image in images]
-    raise ValueError(f"Unsupported view sample index: {view_index}.")
-
-
-def _score_wd_outputs(
-    *,
-    generated_outputs: WDImageOutputs,
-    reference_cache: WDReferenceCache,
-    prompt_hashes: list[str],
-    score_type: str,
-) -> torch.Tensor:
-    """Compute one reward score per generated output."""
-    if score_type == "embedding_cosine":
-        reference_embeddings = torch.stack(
-            [reference_cache.embeddings[prompt_hash] for prompt_hash in prompt_hashes]
-        )
-        return (generated_outputs.embeddings * reference_embeddings).sum(dim=-1)
-
-    if score_type == "soft_jaccard":
-        reference_probabilities_by_hash = reference_cache.require_probabilities()
-        reference_probabilities = torch.stack(
-            [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
-        )
-        return soft_jaccard_score(
-            generated_outputs.probabilities,
-            reference_probabilities,
-        )
-
-    if score_type == "wd_distribution":
-        reference_probabilities_by_hash = reference_cache.require_probabilities()
-        reference_probabilities = torch.stack(
-            [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
-        )
-        return wd_distribution_reward(
-            real_probabilities=reference_probabilities,
-            fake_probabilities=generated_outputs.probabilities,
-        )
-
-    raise ValueError(f"Unsupported score_type: {score_type}")
-
-
-def _compute_view_min_rewards(
-    *,
-    encoder: WDEVA02EmbeddingModel,
-    reference_cache: WDReferenceCache,
-    prompt_hashes: list[str],
-    images: list[Image.Image],
-    score_type: str,
-) -> list[float]:
-    """Score all deterministic views and return the per-sample minimum reward."""
-    view_scores = []
-    for view_index in range(VIEW_SAMPLE_COUNT):
-        view_images = _build_view_images(images, view_index)
-        generated_outputs = encoder.encode_image_outputs(view_images)
-        scores = _score_wd_outputs(
-            generated_outputs=generated_outputs,
-            reference_cache=reference_cache,
-            prompt_hashes=prompt_hashes,
-            score_type=score_type,
-        )
-        view_scores.append(scores.float())
-
-    rewards_tensor = torch.stack(view_scores, dim=0).min(dim=0).values
-    return rewards_tensor.float().tolist()
-
-
 class WDEVA02PromptHashProcessWorker:
     """Process worker for one WD prompt-hash GPU rank."""
 
@@ -312,13 +203,33 @@ class WDEVA02PromptHashProcessWorker:
                 f"first missing hash: {missing_hashes[0]}"
             )
 
-        return _compute_view_min_rewards(
-            encoder=self.encoder,
-            reference_cache=self.reference_cache,
-            prompt_hashes=prompt_hashes,
-            images=images,
-            score_type=self.score_type,
-        )
+        generated_outputs = self.encoder.encode_image_outputs(images)
+        if self.score_type == "embedding_cosine":
+            reference_embeddings = torch.stack(
+                [self.reference_cache.embeddings[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = (generated_outputs.embeddings * reference_embeddings).sum(dim=-1)
+        elif self.score_type == "soft_jaccard":
+            reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+            reference_probabilities = torch.stack(
+                [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = soft_jaccard_score(
+                generated_outputs.probabilities,
+                reference_probabilities,
+            )
+        elif self.score_type == "wd_distribution":
+            reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+            reference_probabilities = torch.stack(
+                [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = wd_distribution_reward(
+                real_probabilities=reference_probabilities,
+                fake_probabilities=generated_outputs.probabilities,
+            )
+        else:
+            raise ValueError(f"Unsupported score_type: {self.score_type}")
+        return rewards.float().tolist()
 
     def close(self) -> None:
         """Release CUDA memory held by this worker."""
@@ -381,16 +292,13 @@ class WDEVA02PromptHashService:
         )
         LOGGER.info(
             "WD prompt-hash device config: device=%s dtype=%s visible_cuda_devices=%s "
-            "process_pool=%s device_ids=%s score_type=%s view_samples=%s "
-            "view_augmentations=%s view_aggregation=min",
+            "process_pool=%s device_ids=%s score_type=%s",
             self.device,
             self.dtype,
             torch.cuda.device_count() if torch.cuda.is_available() else 0,
             self.process_pool_enabled,
             self.device_ids,
             self.score_type,
-            VIEW_SAMPLE_COUNT,
-            VIEW_AUGMENTATION_COUNT,
         )
 
     @staticmethod
@@ -507,12 +415,9 @@ class WDEVA02PromptHashService:
             )
 
         LOGGER.info(
-            "WD compute request: samples=%s score_type=%s view_samples=%s "
-            "view_augmentations=%s view_aggregation=min process_pool=%s active_gpus=%s",
+            "WD compute request: samples=%s score_type=%s process_pool=%s active_gpus=%s",
             sample_count,
             self.score_type,
-            VIEW_SAMPLE_COUNT,
-            VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
         )
@@ -536,24 +441,52 @@ class WDEVA02PromptHashService:
                     image_payload=image_payload,
                     video_payload=video_payload,
                 )
-                rewards = _compute_view_min_rewards(
-                    encoder=self.encoder,
-                    reference_cache=self.reference_cache,
-                    prompt_hashes=prompt_hashes,
-                    images=images,
-                    score_type=self.score_type,
-                )
+                generated_outputs = self.encoder.encode_image_outputs(images)
+                if self.score_type == "embedding_cosine":
+                    reference_embeddings = torch.stack(
+                        [
+                            self.reference_cache.embeddings[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = (generated_outputs.embeddings * reference_embeddings).sum(
+                        dim=-1
+                    )
+                elif self.score_type == "soft_jaccard":
+                    reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+                    reference_probabilities = torch.stack(
+                        [
+                            reference_probabilities_by_hash[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = soft_jaccard_score(
+                        generated_outputs.probabilities,
+                        reference_probabilities,
+                    )
+                elif self.score_type == "wd_distribution":
+                    reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+                    reference_probabilities = torch.stack(
+                        [
+                            reference_probabilities_by_hash[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = wd_distribution_reward(
+                        real_probabilities=reference_probabilities,
+                        fake_probabilities=generated_outputs.probabilities,
+                    )
+                else:
+                    raise ValueError(f"Unsupported score_type: {self.score_type}")
+                rewards = rewards_tensor.float().tolist()
         finally:
             self._exit_compute()
 
         LOGGER.info(
-            "WD compute complete: samples=%s score_type=%s view_samples=%s "
-            "view_augmentations=%s view_aggregation=min process_pool=%s "
+            "WD compute complete: samples=%s score_type=%s process_pool=%s "
             "active_gpus=%s elapsed_s=%.3f",
             sample_count,
             self.score_type,
-            VIEW_SAMPLE_COUNT,
-            VIEW_AUGMENTATION_COUNT,
             self.process_pool_enabled,
             len(self.device_ids) if self.process_pool_enabled else 1,
             time.perf_counter() - start_time,
@@ -601,10 +534,6 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     ),
                     "device_ids": self.service.device_ids,
                     "loaded": self.service._loaded_on_device,
-                    "view_samples": VIEW_SAMPLE_COUNT,
-                    "view_augmentations": VIEW_AUGMENTATION_COUNT,
-                    "view_aggregation": "min",
-                    "include_original_view": True,
                 }
             )
             return
