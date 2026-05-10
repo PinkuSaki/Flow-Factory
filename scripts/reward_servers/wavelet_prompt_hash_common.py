@@ -95,7 +95,7 @@ class WaveletDescriptorConfig:
             "color_space": self.color_space,
             "include_approximation": self.include_approximation,
             "level_weight_decay": self.level_weight_decay,
-            "descriptor_transform": "log1p_energy_distribution",
+            "descriptor_transform": "multicomponent_log1p_energy_and_lowfreq",
         }
 
 
@@ -106,6 +106,12 @@ class WaveletImageOutputs:
     distributions: torch.Tensor
     log_energies: torch.Tensor
     total_energies: torch.Tensor
+    luminance_structure_distributions: torch.Tensor
+    luminance_structure_log_energies: torch.Tensor
+    luminance_lowfreq_vectors: torch.Tensor
+    chroma_lowfreq_vectors: torch.Tensor
+    chroma_midfreq_distributions: torch.Tensor
+    chroma_midfreq_log_energies: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,12 @@ class WaveletReferenceCache:
     distributions: dict[str, torch.Tensor]
     log_energies: dict[str, torch.Tensor]
     total_energies: dict[str, torch.Tensor]
+    luminance_structure_distributions: dict[str, torch.Tensor]
+    luminance_structure_log_energies: dict[str, torch.Tensor]
+    luminance_lowfreq_vectors: dict[str, torch.Tensor]
+    chroma_lowfreq_vectors: dict[str, torch.Tensor]
+    chroma_midfreq_distributions: dict[str, torch.Tensor]
+    chroma_midfreq_log_energies: dict[str, torch.Tensor]
     metadata: dict[str, Any]
 
 
@@ -232,6 +244,64 @@ def _extract_channel_energies(
     return energies
 
 
+def _extract_channel_detail_energies_and_lowfreq(
+    channel: np.ndarray,
+    config: WaveletDescriptorConfig,
+) -> tuple[list[list[float]], torch.Tensor]:
+    """Extract per-level Haar detail energies and the final low-frequency map."""
+    current = channel
+    detail_energies_by_level: list[list[float]] = []
+    for level_index in range(config.levels):
+        ll, lh, hl, hh = _haar_step(current)
+        weight = config.level_weight_decay**level_index
+        detail_energies_by_level.append(
+            [
+                _weighted_band_energy(lh, weight),
+                _weighted_band_energy(hl, weight),
+                _weighted_band_energy(hh, weight),
+            ]
+        )
+        current = ll
+
+    lowfreq_map = current / float(2**config.levels)
+    lowfreq_vector = torch.from_numpy(lowfreq_map.astype(np.float32, copy=False).reshape(-1))
+    return detail_energies_by_level, lowfreq_vector
+
+
+def _mid_frequency_level_indices(levels: int) -> list[int]:
+    """Return detail level indices used for color mid-frequency comparison."""
+    if levels <= 0:
+        raise ValueError(f"levels must be positive, got {levels}.")
+    if levels <= 2:
+        return list(range(levels))
+    return list(range(1, levels - 1))
+
+
+def _normalize_log_energy_distribution(
+    raw_energies: list[float],
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert raw non-negative energies into log energies and a distribution."""
+    raw_energy_tensor = torch.tensor(raw_energies, dtype=torch.float32)
+    if torch.any(~torch.isfinite(raw_energy_tensor)):
+        raise ValueError("Wavelet descriptor contains non-finite raw energies.")
+
+    log_energy_tensor = torch.log1p(raw_energy_tensor)
+    distribution = log_energy_tensor / log_energy_tensor.sum().clamp_min(eps)
+    return log_energy_tensor, distribution
+
+
+def _image_to_ycbcr_channel_array(
+    image: Image.Image,
+    config: WaveletDescriptorConfig,
+) -> np.ndarray:
+    """Convert a PIL image into YCbCr channel-first floats in [0, 1]."""
+    image = _pad_to_square(image)
+    image = image.resize((config.image_size, config.image_size), Image.Resampling.BICUBIC)
+    array = np.asarray(image.convert("YCbCr"), dtype=np.float32) / 255.0
+    return np.transpose(array, (2, 0, 1))
+
+
 def extract_wavelet_outputs(
     images: list[Image.Image],
     config: WaveletDescriptorConfig,
@@ -245,32 +315,83 @@ def extract_wavelet_outputs(
     distributions = []
     log_energies = []
     total_energies = []
+    luminance_structure_distributions = []
+    luminance_structure_log_energies = []
+    luminance_lowfreq_vectors = []
+    chroma_lowfreq_vectors = []
+    chroma_midfreq_distributions = []
+    chroma_midfreq_log_energies = []
     for image in images:
         channel_array = _image_to_channel_array(image, config)
         raw_energies: list[float] = []
         for channel in channel_array:
             raw_energies.extend(_extract_channel_energies(channel, config))
 
-        raw_energy_tensor = torch.tensor(raw_energies, dtype=torch.float32)
-        if torch.any(~torch.isfinite(raw_energy_tensor)):
-            raise ValueError("Wavelet descriptor contains non-finite raw energies.")
-
-        log_energy_tensor = torch.log1p(raw_energy_tensor)
-        distribution = log_energy_tensor / log_energy_tensor.sum().clamp_min(eps)
+        log_energy_tensor, distribution = _normalize_log_energy_distribution(
+            raw_energies,
+            eps,
+        )
         distributions.append(distribution)
         log_energies.append(log_energy_tensor)
-        total_energies.append(raw_energy_tensor.sum())
+        total_energies.append(torch.expm1(log_energy_tensor).sum())
+
+        ycbcr_channels = _image_to_ycbcr_channel_array(image, config)
+        y_detail_energies_by_level, y_lowfreq_vector = _extract_channel_detail_energies_and_lowfreq(
+            ycbcr_channels[0], config
+        )
+        y_structure_energies = [
+            energy for level_energies in y_detail_energies_by_level for energy in level_energies
+        ]
+        y_log_energies, y_distribution = _normalize_log_energy_distribution(
+            y_structure_energies,
+            eps,
+        )
+        luminance_structure_log_energies.append(y_log_energies)
+        luminance_structure_distributions.append(y_distribution)
+        luminance_lowfreq_vectors.append(y_lowfreq_vector)
+
+        mid_indices = _mid_frequency_level_indices(config.levels)
+        chroma_lowfreq_parts = []
+        chroma_midfreq_energies = []
+        for chroma_channel in ycbcr_channels[1:]:
+            chroma_detail_energies_by_level, chroma_lowfreq_vector = (
+                _extract_channel_detail_energies_and_lowfreq(chroma_channel, config)
+            )
+            chroma_lowfreq_parts.append(chroma_lowfreq_vector)
+            for level_index in mid_indices:
+                chroma_midfreq_energies.extend(chroma_detail_energies_by_level[level_index])
+
+        chroma_lowfreq_vectors.append(torch.cat(chroma_lowfreq_parts, dim=0))
+        chroma_log_energies, chroma_distribution = _normalize_log_energy_distribution(
+            chroma_midfreq_energies,
+            eps,
+        )
+        chroma_midfreq_log_energies.append(chroma_log_energies)
+        chroma_midfreq_distributions.append(chroma_distribution)
 
     return WaveletImageOutputs(
         distributions=torch.stack(distributions, dim=0),
         log_energies=torch.stack(log_energies, dim=0),
         total_energies=torch.stack(total_energies, dim=0),
+        luminance_structure_distributions=torch.stack(
+            luminance_structure_distributions,
+            dim=0,
+        ),
+        luminance_structure_log_energies=torch.stack(
+            luminance_structure_log_energies,
+            dim=0,
+        ),
+        luminance_lowfreq_vectors=torch.stack(luminance_lowfreq_vectors, dim=0),
+        chroma_lowfreq_vectors=torch.stack(chroma_lowfreq_vectors, dim=0),
+        chroma_midfreq_distributions=torch.stack(chroma_midfreq_distributions, dim=0),
+        chroma_midfreq_log_energies=torch.stack(chroma_midfreq_log_energies, dim=0),
     )
 
 
 def bhattacharyya_score(
     generated_distributions: torch.Tensor,
     reference_distributions: torch.Tensor,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """Compute bounded distribution similarity for two wavelet energy distributions."""
     if generated_distributions.shape != reference_distributions.shape:
@@ -279,9 +400,12 @@ def bhattacharyya_score(
             f"generated={tuple(generated_distributions.shape)} "
             f"reference={tuple(reference_distributions.shape)}"
         )
-    return torch.sqrt(
+    scores = torch.sqrt(
         generated_distributions.clamp_min(0) * reference_distributions.clamp_min(0)
     ).sum(dim=-1)
+    generated_empty = generated_distributions.sum(dim=-1).abs() <= eps
+    reference_empty = reference_distributions.sum(dim=-1).abs() <= eps
+    return torch.where(generated_empty & reference_empty, torch.ones_like(scores), scores)
 
 
 def soft_jaccard_score(
@@ -298,7 +422,8 @@ def soft_jaccard_score(
         )
     intersection = torch.minimum(generated_distributions, reference_distributions).sum(dim=-1)
     union = torch.maximum(generated_distributions, reference_distributions).sum(dim=-1)
-    return intersection / union.clamp_min(eps)
+    scores = intersection / union.clamp_min(eps)
+    return torch.where(union <= eps, torch.ones_like(scores), scores)
 
 
 def cosine_log_energy_score(
@@ -312,9 +437,87 @@ def cosine_log_energy_score(
             f"generated={tuple(generated_log_energies.shape)} "
             f"reference={tuple(reference_log_energies.shape)}"
         )
+    generated_norm = generated_log_energies.norm(dim=-1)
+    reference_norm = reference_log_energies.norm(dim=-1)
     generated_normalized = F.normalize(generated_log_energies, dim=-1)
     reference_normalized = F.normalize(reference_log_energies, dim=-1)
-    return (generated_normalized * reference_normalized).sum(dim=-1)
+    scores = (generated_normalized * reference_normalized).sum(dim=-1)
+    return torch.where(
+        (generated_norm <= 1e-8) & (reference_norm <= 1e-8),
+        torch.ones_like(scores),
+        scores,
+    )
+
+
+def descriptor_similarity_score(
+    generated_distributions: torch.Tensor,
+    reference_distributions: torch.Tensor,
+    generated_log_energies: torch.Tensor,
+    reference_log_energies: torch.Tensor,
+    score_type: str,
+) -> torch.Tensor:
+    """Compute one descriptor similarity score by score type."""
+    if score_type == "bhattacharyya":
+        return bhattacharyya_score(generated_distributions, reference_distributions)
+    if score_type == "soft_jaccard":
+        return soft_jaccard_score(generated_distributions, reference_distributions)
+    if score_type == "cosine_log_energy":
+        return cosine_log_energy_score(generated_log_energies, reference_log_energies)
+    raise ValueError(f"Unsupported score_type: {score_type}")
+
+
+def lowfreq_l1_similarity(
+    generated_vectors: torch.Tensor,
+    reference_vectors: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    """Compare low-frequency maps with an exponential L1 kernel."""
+    if tau <= 0:
+        raise ValueError(f"lowfreq_tau must be positive, got {tau}.")
+    if generated_vectors.shape != reference_vectors.shape:
+        raise ValueError(
+            "Low-frequency vector shape mismatch: "
+            f"generated={tuple(generated_vectors.shape)} "
+            f"reference={tuple(reference_vectors.shape)}"
+        )
+    distance = torch.mean(torch.abs(generated_vectors - reference_vectors), dim=-1)
+    return torch.exp(-distance / tau)
+
+
+def hh1_excess_similarity(
+    generated_luminance_log_energies: torch.Tensor,
+    reference_luminance_log_energies: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    """Penalize only excessive generated luminance HH1 detail energy."""
+    if tau <= 0:
+        raise ValueError(f"hh1_excess_tau must be positive, got {tau}.")
+    if generated_luminance_log_energies.shape != reference_luminance_log_energies.shape:
+        raise ValueError(
+            "Luminance structure log-energy shape mismatch: "
+            f"generated={tuple(generated_luminance_log_energies.shape)} "
+            f"reference={tuple(reference_luminance_log_energies.shape)}"
+        )
+    if generated_luminance_log_energies.shape[-1] < 3:
+        raise ValueError(
+            "Luminance structure descriptor must contain at least LH1, HL1, and HH1 bands."
+        )
+
+    generated_hh1 = generated_luminance_log_energies[..., 2]
+    reference_hh1 = reference_luminance_log_energies[..., 2]
+    excess = torch.relu(generated_hh1 - reference_hh1)
+    return torch.exp(-excess / tau)
+
+
+def normalize_reward_weights(weights: dict[str, float]) -> dict[str, float]:
+    """Normalize non-negative component weights."""
+    for name, weight in weights.items():
+        if weight < 0:
+            raise ValueError(f"{name} must be non-negative, got {weight}.")
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("At least one reward component weight must be positive.")
+    return {name: weight / total for name, weight in weights.items()}
 
 
 def total_energy_similarity(
@@ -346,35 +549,71 @@ def wavelet_similarity_reward(
     score_type: str,
     distribution_weight: float,
     total_energy_tau: float,
+    lowfreq_tau: float,
+    luminance_structure_weight: float,
+    luminance_lowfreq_weight: float,
+    chroma_lowfreq_weight: float,
+    chroma_midfreq_weight: float,
+    hh1_excess_weight: float,
+    hh1_excess_tau: float,
 ) -> torch.Tensor:
     """Compute the final wavelet similarity reward."""
     if not 0.0 <= distribution_weight <= 1.0:
         raise ValueError(f"distribution_weight must be in [0, 1], got {distribution_weight}.")
+    component_weights = normalize_reward_weights(
+        {
+            "luminance_structure": luminance_structure_weight,
+            "luminance_lowfreq": luminance_lowfreq_weight,
+            "chroma_lowfreq": chroma_lowfreq_weight,
+            "chroma_midfreq": chroma_midfreq_weight,
+            "hh1_excess": hh1_excess_weight,
+        }
+    )
 
-    if score_type == "bhattacharyya":
-        distribution_score = bhattacharyya_score(
-            generated_outputs.distributions,
-            reference_outputs.distributions,
-        )
-    elif score_type == "soft_jaccard":
-        distribution_score = soft_jaccard_score(
-            generated_outputs.distributions,
-            reference_outputs.distributions,
-        )
-    elif score_type == "cosine_log_energy":
-        distribution_score = cosine_log_energy_score(
-            generated_outputs.log_energies,
-            reference_outputs.log_energies,
-        )
-    else:
-        raise ValueError(f"Unsupported score_type: {score_type}")
+    luminance_structure_score = descriptor_similarity_score(
+        generated_outputs.luminance_structure_distributions,
+        reference_outputs.luminance_structure_distributions,
+        generated_outputs.luminance_structure_log_energies,
+        reference_outputs.luminance_structure_log_energies,
+        score_type,
+    )
+    luminance_lowfreq_score = lowfreq_l1_similarity(
+        generated_outputs.luminance_lowfreq_vectors,
+        reference_outputs.luminance_lowfreq_vectors,
+        tau=lowfreq_tau,
+    )
+    chroma_lowfreq_score = lowfreq_l1_similarity(
+        generated_outputs.chroma_lowfreq_vectors,
+        reference_outputs.chroma_lowfreq_vectors,
+        tau=lowfreq_tau,
+    )
+    chroma_midfreq_score = descriptor_similarity_score(
+        generated_outputs.chroma_midfreq_distributions,
+        reference_outputs.chroma_midfreq_distributions,
+        generated_outputs.chroma_midfreq_log_energies,
+        reference_outputs.chroma_midfreq_log_energies,
+        score_type,
+    )
+    hh1_excess_score = hh1_excess_similarity(
+        generated_outputs.luminance_structure_log_energies,
+        reference_outputs.luminance_structure_log_energies,
+        tau=hh1_excess_tau,
+    )
+
+    component_score = (
+        component_weights["luminance_structure"] * luminance_structure_score
+        + component_weights["luminance_lowfreq"] * luminance_lowfreq_score
+        + component_weights["chroma_lowfreq"] * chroma_lowfreq_score
+        + component_weights["chroma_midfreq"] * chroma_midfreq_score
+        + component_weights["hh1_excess"] * hh1_excess_score
+    )
 
     energy_score = total_energy_similarity(
         generated_outputs.total_energies,
         reference_outputs.total_energies,
         tau=total_energy_tau,
     )
-    return distribution_weight * distribution_score + (1.0 - distribution_weight) * energy_score
+    return distribution_weight * component_score + (1.0 - distribution_weight) * energy_score
 
 
 def save_reference_cache(
@@ -394,11 +633,53 @@ def save_reference_cache(
     total_energies = torch.stack(
         [outputs_by_hash[prompt_hash].total_energies.squeeze(0) for prompt_hash in prompt_hashes]
     )
+    luminance_structure_distributions = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].luminance_structure_distributions.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
+    luminance_structure_log_energies = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].luminance_structure_log_energies.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
+    luminance_lowfreq_vectors = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].luminance_lowfreq_vectors.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
+    chroma_lowfreq_vectors = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].chroma_lowfreq_vectors.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
+    chroma_midfreq_distributions = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].chroma_midfreq_distributions.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
+    chroma_midfreq_log_energies = torch.stack(
+        [
+            outputs_by_hash[prompt_hash].chroma_midfreq_log_energies.squeeze(0)
+            for prompt_hash in prompt_hashes
+        ]
+    )
     payload: dict[str, Any] = {
         "prompt_hashes": prompt_hashes,
         "distributions": distributions,
         "log_energies": log_energies,
         "total_energies": total_energies,
+        "luminance_structure_distributions": luminance_structure_distributions,
+        "luminance_structure_log_energies": luminance_structure_log_energies,
+        "luminance_lowfreq_vectors": luminance_lowfreq_vectors,
+        "chroma_lowfreq_vectors": chroma_lowfreq_vectors,
+        "chroma_midfreq_distributions": chroma_midfreq_distributions,
+        "chroma_midfreq_log_energies": chroma_midfreq_log_energies,
         **metadata,
     }
     torch.save(payload, cache_path)
@@ -414,39 +695,76 @@ def load_reference_cache_payload(cache_path: Path) -> WaveletReferenceCache:
     except TypeError:
         payload = torch.load(cache_path, map_location="cpu")
 
-    required_keys = {"prompt_hashes", "distributions", "log_energies", "total_energies"}
+    required_keys = {
+        "prompt_hashes",
+        "distributions",
+        "log_energies",
+        "total_energies",
+        "luminance_structure_distributions",
+        "luminance_structure_log_energies",
+        "luminance_lowfreq_vectors",
+        "chroma_lowfreq_vectors",
+        "chroma_midfreq_distributions",
+        "chroma_midfreq_log_energies",
+    }
     if not isinstance(payload, dict) or not required_keys.issubset(payload.keys()):
+        missing_keys = (
+            sorted(required_keys - set(payload.keys())) if isinstance(payload, dict) else []
+        )
         raise ValueError(
             "Unsupported wavelet reference cache format. Expected keys: "
-            "prompt_hashes, distributions, log_energies, total_energies."
+            f"{sorted(required_keys)}. Missing keys: {missing_keys}. "
+            "Rebuild the cache with build_wavelet_prompt_hash_cache.py."
         )
 
     prompt_hashes = [str(prompt_hash) for prompt_hash in payload["prompt_hashes"]]
     distributions = torch.as_tensor(payload["distributions"], dtype=torch.float32)
     log_energies = torch.as_tensor(payload["log_energies"], dtype=torch.float32)
     total_energies = torch.as_tensor(payload["total_energies"], dtype=torch.float32)
+    luminance_structure_distributions = torch.as_tensor(
+        payload["luminance_structure_distributions"],
+        dtype=torch.float32,
+    )
+    luminance_structure_log_energies = torch.as_tensor(
+        payload["luminance_structure_log_energies"],
+        dtype=torch.float32,
+    )
+    luminance_lowfreq_vectors = torch.as_tensor(
+        payload["luminance_lowfreq_vectors"],
+        dtype=torch.float32,
+    )
+    chroma_lowfreq_vectors = torch.as_tensor(
+        payload["chroma_lowfreq_vectors"],
+        dtype=torch.float32,
+    )
+    chroma_midfreq_distributions = torch.as_tensor(
+        payload["chroma_midfreq_distributions"],
+        dtype=torch.float32,
+    )
+    chroma_midfreq_log_energies = torch.as_tensor(
+        payload["chroma_midfreq_log_energies"],
+        dtype=torch.float32,
+    )
 
-    if len(prompt_hashes) != distributions.shape[0]:
-        raise ValueError(
-            f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
-            f"distributions rows ({distributions.shape[0]})."
-        )
-    if len(prompt_hashes) != log_energies.shape[0]:
-        raise ValueError(
-            f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
-            f"log_energies rows ({log_energies.shape[0]})."
-        )
-    if len(prompt_hashes) != total_energies.shape[0]:
-        raise ValueError(
-            f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
-            f"total_energies rows ({total_energies.shape[0]})."
-        )
-
-    metadata = {
-        key: value
-        for key, value in payload.items()
-        if key not in {"prompt_hashes", "distributions", "log_energies", "total_energies"}
+    tensors_by_name = {
+        "distributions": distributions,
+        "log_energies": log_energies,
+        "total_energies": total_energies,
+        "luminance_structure_distributions": luminance_structure_distributions,
+        "luminance_structure_log_energies": luminance_structure_log_energies,
+        "luminance_lowfreq_vectors": luminance_lowfreq_vectors,
+        "chroma_lowfreq_vectors": chroma_lowfreq_vectors,
+        "chroma_midfreq_distributions": chroma_midfreq_distributions,
+        "chroma_midfreq_log_energies": chroma_midfreq_log_energies,
     }
+    for name, tensor in tensors_by_name.items():
+        if len(prompt_hashes) != tensor.shape[0]:
+            raise ValueError(
+                f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
+                f"{name} rows ({tensor.shape[0]})."
+            )
+
+    metadata = {key: value for key, value in payload.items() if key not in required_keys}
     return WaveletReferenceCache(
         prompt_hashes=prompt_hashes,
         distributions={
@@ -459,6 +777,30 @@ def load_reference_cache_payload(cache_path: Path) -> WaveletReferenceCache:
         },
         total_energies={
             prompt_hash: total_energies[index].reshape(()).detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        luminance_structure_distributions={
+            prompt_hash: luminance_structure_distributions[index].detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        luminance_structure_log_energies={
+            prompt_hash: luminance_structure_log_energies[index].detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        luminance_lowfreq_vectors={
+            prompt_hash: luminance_lowfreq_vectors[index].detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        chroma_lowfreq_vectors={
+            prompt_hash: chroma_lowfreq_vectors[index].detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        chroma_midfreq_distributions={
+            prompt_hash: chroma_midfreq_distributions[index].detach().cpu()
+            for index, prompt_hash in enumerate(prompt_hashes)
+        },
+        chroma_midfreq_log_energies={
+            prompt_hash: chroma_midfreq_log_energies[index].detach().cpu()
             for index, prompt_hash in enumerate(prompt_hashes)
         },
         metadata=metadata,
