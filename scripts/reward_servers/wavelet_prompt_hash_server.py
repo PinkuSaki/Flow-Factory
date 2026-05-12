@@ -74,13 +74,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--distribution-weight",
-        "--component-weight",
-        dest="distribution_weight",
         type=float,
         default=0.8,
         help=(
-            "Weight for the multi-component descriptor score. The remaining weight is "
-            "applied to total wavelet energy similarity."
+            "Weight for the descriptor distribution score. The remaining weight is applied "
+            "to total wavelet energy similarity."
         ),
     )
     parser.add_argument(
@@ -88,48 +86,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Temperature for total wavelet energy log-ratio similarity.",
-    )
-    parser.add_argument(
-        "--lowfreq-tau",
-        type=float,
-        default=0.08,
-        help="Temperature for luminance and chroma low-frequency L1 similarity.",
-    )
-    parser.add_argument(
-        "--luminance-structure-weight",
-        type=float,
-        default=0.4,
-        help="Component weight for luminance detail-band structure.",
-    )
-    parser.add_argument(
-        "--luminance-lowfreq-weight",
-        type=float,
-        default=0.25,
-        help="Component weight for luminance low-frequency map similarity.",
-    )
-    parser.add_argument(
-        "--chroma-lowfreq-weight",
-        type=float,
-        default=0.2,
-        help="Component weight for CbCr low-frequency map similarity.",
-    )
-    parser.add_argument(
-        "--chroma-midfreq-weight",
-        type=float,
-        default=0.15,
-        help="Component weight for CbCr middle-frequency detail similarity.",
-    )
-    parser.add_argument(
-        "--hh1-excess-weight",
-        type=float,
-        default=0.1,
-        help="Component weight for penalizing excessive luminance HH1 detail energy.",
-    )
-    parser.add_argument(
-        "--hh1-excess-tau",
-        type=float,
-        default=0.5,
-        help="Temperature for excessive luminance HH1 log-energy penalty.",
     )
     parser.add_argument(
         "--num-workers",
@@ -242,30 +198,6 @@ def _concat_wavelet_outputs(outputs: list[WaveletImageOutputs]) -> WaveletImageO
         distributions=torch.cat([output.distributions for output in outputs], dim=0),
         log_energies=torch.cat([output.log_energies for output in outputs], dim=0),
         total_energies=torch.cat([output.total_energies for output in outputs], dim=0),
-        luminance_structure_distributions=torch.cat(
-            [output.luminance_structure_distributions for output in outputs],
-            dim=0,
-        ),
-        luminance_structure_log_energies=torch.cat(
-            [output.luminance_structure_log_energies for output in outputs],
-            dim=0,
-        ),
-        luminance_lowfreq_vectors=torch.cat(
-            [output.luminance_lowfreq_vectors for output in outputs],
-            dim=0,
-        ),
-        chroma_lowfreq_vectors=torch.cat(
-            [output.chroma_lowfreq_vectors for output in outputs],
-            dim=0,
-        ),
-        chroma_midfreq_distributions=torch.cat(
-            [output.chroma_midfreq_distributions for output in outputs],
-            dim=0,
-        ),
-        chroma_midfreq_log_energies=torch.cat(
-            [output.chroma_midfreq_log_energies for output in outputs],
-            dim=0,
-        ),
     )
 
 
@@ -278,26 +210,12 @@ class WaveletPromptHashService:
         score_type: str,
         distribution_weight: float,
         total_energy_tau: float,
-        lowfreq_tau: float,
-        luminance_structure_weight: float,
-        luminance_lowfreq_weight: float,
-        chroma_lowfreq_weight: float,
-        chroma_midfreq_weight: float,
-        hh1_excess_weight: float,
-        hh1_excess_tau: float,
         num_workers: int,
     ) -> None:
         self.cache_path = cache_path
         self.score_type = score_type
         self.distribution_weight = distribution_weight
         self.total_energy_tau = total_energy_tau
-        self.lowfreq_tau = lowfreq_tau
-        self.luminance_structure_weight = luminance_structure_weight
-        self.luminance_lowfreq_weight = luminance_lowfreq_weight
-        self.chroma_lowfreq_weight = chroma_lowfreq_weight
-        self.chroma_midfreq_weight = chroma_midfreq_weight
-        self.hh1_excess_weight = hh1_excess_weight
-        self.hh1_excess_tau = hh1_excess_tau
         self.num_workers = num_workers
         self.reference_cache = load_reference_cache_payload(cache_path)
         self.descriptor_config = WaveletDescriptorConfig.from_metadata(
@@ -319,22 +237,6 @@ class WaveletPromptHashService:
             )
         if self.total_energy_tau <= 0:
             raise ValueError(f"total_energy_tau must be positive, got {self.total_energy_tau}.")
-        if self.lowfreq_tau <= 0:
-            raise ValueError(f"lowfreq_tau must be positive, got {self.lowfreq_tau}.")
-        if self.hh1_excess_tau <= 0:
-            raise ValueError(f"hh1_excess_tau must be positive, got {self.hh1_excess_tau}.")
-        component_weights = {
-            "luminance_structure_weight": self.luminance_structure_weight,
-            "luminance_lowfreq_weight": self.luminance_lowfreq_weight,
-            "chroma_lowfreq_weight": self.chroma_lowfreq_weight,
-            "chroma_midfreq_weight": self.chroma_midfreq_weight,
-            "hh1_excess_weight": self.hh1_excess_weight,
-        }
-        for name, weight in component_weights.items():
-            if weight < 0:
-                raise ValueError(f"{name} must be non-negative, got {weight}.")
-        if sum(component_weights.values()) <= 0:
-            raise ValueError("At least one wavelet component weight must be positive.")
 
         LOGGER.info(
             "Loaded %s wavelet reference entries from %s",
@@ -344,10 +246,7 @@ class WaveletPromptHashService:
         LOGGER.info(
             "Wavelet prompt-hash config: image_size=%s levels=%s color_space=%s "
             "include_approximation=%s level_weight_decay=%s score_type=%s "
-            "distribution_weight=%s total_energy_tau=%s lowfreq_tau=%s "
-            "luminance_structure_weight=%s luminance_lowfreq_weight=%s "
-            "chroma_lowfreq_weight=%s chroma_midfreq_weight=%s "
-            "hh1_excess_weight=%s hh1_excess_tau=%s num_workers=%s",
+            "distribution_weight=%s total_energy_tau=%s num_workers=%s",
             self.descriptor_config.image_size,
             self.descriptor_config.levels,
             self.descriptor_config.color_space,
@@ -356,13 +255,6 @@ class WaveletPromptHashService:
             self.score_type,
             self.distribution_weight,
             self.total_energy_tau,
-            self.lowfreq_tau,
-            self.luminance_structure_weight,
-            self.luminance_lowfreq_weight,
-            self.chroma_lowfreq_weight,
-            self.chroma_midfreq_weight,
-            self.hh1_excess_weight,
-            self.hh1_excess_tau,
             self.num_workers,
         )
 
@@ -400,42 +292,6 @@ class WaveletPromptHashService:
             ),
             total_energies=torch.stack(
                 [self.reference_cache.total_energies[prompt_hash] for prompt_hash in prompt_hashes]
-            ),
-            luminance_structure_distributions=torch.stack(
-                [
-                    self.reference_cache.luminance_structure_distributions[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
-            ),
-            luminance_structure_log_energies=torch.stack(
-                [
-                    self.reference_cache.luminance_structure_log_energies[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
-            ),
-            luminance_lowfreq_vectors=torch.stack(
-                [
-                    self.reference_cache.luminance_lowfreq_vectors[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
-            ),
-            chroma_lowfreq_vectors=torch.stack(
-                [
-                    self.reference_cache.chroma_lowfreq_vectors[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
-            ),
-            chroma_midfreq_distributions=torch.stack(
-                [
-                    self.reference_cache.chroma_midfreq_distributions[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
-            ),
-            chroma_midfreq_log_energies=torch.stack(
-                [
-                    self.reference_cache.chroma_midfreq_log_energies[prompt_hash]
-                    for prompt_hash in prompt_hashes
-                ]
             ),
         )
 
@@ -524,13 +380,6 @@ class WaveletPromptHashService:
                 score_type=self.score_type,
                 distribution_weight=self.distribution_weight,
                 total_energy_tau=self.total_energy_tau,
-                lowfreq_tau=self.lowfreq_tau,
-                luminance_structure_weight=self.luminance_structure_weight,
-                luminance_lowfreq_weight=self.luminance_lowfreq_weight,
-                chroma_lowfreq_weight=self.chroma_lowfreq_weight,
-                chroma_midfreq_weight=self.chroma_midfreq_weight,
-                hh1_excess_weight=self.hh1_excess_weight,
-                hh1_excess_tau=self.hh1_excess_tau,
             )
             reward_values = rewards.float().tolist()
         finally:
@@ -571,18 +420,6 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
         """Handle GET requests."""
         if self.path == "/health":
             descriptor_dim = next(iter(self.service.reference_cache.distributions.values())).numel()
-            luminance_structure_dim = next(
-                iter(self.service.reference_cache.luminance_structure_distributions.values())
-            ).numel()
-            luminance_lowfreq_dim = next(
-                iter(self.service.reference_cache.luminance_lowfreq_vectors.values())
-            ).numel()
-            chroma_lowfreq_dim = next(
-                iter(self.service.reference_cache.chroma_lowfreq_vectors.values())
-            ).numel()
-            chroma_midfreq_dim = next(
-                iter(self.service.reference_cache.chroma_midfreq_distributions.values())
-            ).numel()
             self._send_json(
                 {
                     "status": "ok",
@@ -591,13 +428,6 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "score_type": self.service.score_type,
                     "distribution_weight": self.service.distribution_weight,
                     "total_energy_tau": self.service.total_energy_tau,
-                    "lowfreq_tau": self.service.lowfreq_tau,
-                    "luminance_structure_weight": self.service.luminance_structure_weight,
-                    "luminance_lowfreq_weight": self.service.luminance_lowfreq_weight,
-                    "chroma_lowfreq_weight": self.service.chroma_lowfreq_weight,
-                    "chroma_midfreq_weight": self.service.chroma_midfreq_weight,
-                    "hh1_excess_weight": self.service.hh1_excess_weight,
-                    "hh1_excess_tau": self.service.hh1_excess_tau,
                     "num_workers": self.service.num_workers,
                     "process_pool": self.service.process_pool is not None,
                     "wavelet": "haar",
@@ -607,10 +437,6 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "include_approximation": (self.service.descriptor_config.include_approximation),
                     "level_weight_decay": self.service.descriptor_config.level_weight_decay,
                     "descriptor_dim": descriptor_dim,
-                    "luminance_structure_dim": luminance_structure_dim,
-                    "luminance_lowfreq_dim": luminance_lowfreq_dim,
-                    "chroma_lowfreq_dim": chroma_lowfreq_dim,
-                    "chroma_midfreq_dim": chroma_midfreq_dim,
                     "loaded": self.service._loaded,
                 }
             )
@@ -676,13 +502,6 @@ def main() -> None:
         score_type=args.score_type,
         distribution_weight=args.distribution_weight,
         total_energy_tau=args.total_energy_tau,
-        lowfreq_tau=args.lowfreq_tau,
-        luminance_structure_weight=args.luminance_structure_weight,
-        luminance_lowfreq_weight=args.luminance_lowfreq_weight,
-        chroma_lowfreq_weight=args.chroma_lowfreq_weight,
-        chroma_midfreq_weight=args.chroma_midfreq_weight,
-        hh1_excess_weight=args.hh1_excess_weight,
-        hh1_excess_tau=args.hh1_excess_tau,
         num_workers=args.num_workers,
     )
 

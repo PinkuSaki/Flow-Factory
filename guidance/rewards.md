@@ -486,7 +486,7 @@ python scripts/reward_servers/build_wavelet_prompt_hash_cache.py \
   --cache-path caches/wavelet_refs.pt \
   --image-size 512 \
   --levels 4 \
-  --color-space ycbcr \
+  --color-space y \
   --overwrite
 ```
 
@@ -500,21 +500,12 @@ python scripts/reward_servers/wavelet_prompt_hash_server.py \
   --score-type bhattacharyya \
   --distribution-weight 0.8 \
   --total-energy-tau 1.0 \
-  --lowfreq-tau 0.08 \
-  --luminance-structure-weight 0.4 \
-  --luminance-lowfreq-weight 0.25 \
-  --chroma-lowfreq-weight 0.2 \
-  --chroma-midfreq-weight 0.15 \
-  --hh1-excess-weight 0.1 \
-  --hh1-excess-tau 0.5 \
   --num-workers 4
 ```
 
 The server-side `--num-workers` controls CPU processes inside one `/compute`
 request. It is independent from the training config's `num_workers` and
 `remote_max_concurrent_requests`, which control request-level concurrency.
-The five component weights are normalized internally, then mixed with total
-wavelet energy by `--distribution-weight`.
 
 Use it through the standard remote pointwise wrapper:
 
@@ -531,11 +522,9 @@ rewards:
     retry_attempts: 1
 ```
 
-This reward compares luminance detail structure, luminance low-frequency maps,
-CbCr low-frequency maps, and CbCr middle-frequency detail energy. It also
-penalizes excessive luminance HH1 energy, which discourages over-sharpened
-finest-scale diagonal detail. It does not model semantic prompt alignment. Use
-it as an auxiliary signal together with semantic or aesthetic rewards.
+This reward compares multi-level wavelet energy distributions and does not model
+semantic prompt alignment. Use it as an auxiliary signal together with semantic
+or aesthetic rewards.
 
 ### Server Dependencies
 

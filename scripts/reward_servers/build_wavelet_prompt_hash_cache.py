@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--color-space",
         choices=("y", "rgb", "ycbcr"),
-        default="ycbcr",
+        default="y",
         help="Color representation used for wavelet energy extraction.",
     )
     parser.add_argument(
@@ -199,17 +199,7 @@ def build_cache(args: argparse.Namespace) -> None:
             "prompt_field": args.prompt_field,
             "image_field": args.image_field,
             "reference_jsonl": str(args.reference_jsonl),
-            "cache_fields": [
-                "distributions",
-                "log_energies",
-                "total_energies",
-                "luminance_structure_distributions",
-                "luminance_structure_log_energies",
-                "luminance_lowfreq_vectors",
-                "chroma_lowfreq_vectors",
-                "chroma_midfreq_distributions",
-                "chroma_midfreq_log_energies",
-            ],
+            "cache_fields": ["distributions", "log_energies", "total_energies"],
         },
     )
     LOGGER.info("Saved Haar wavelet reference cache to %s", args.cache_path)
