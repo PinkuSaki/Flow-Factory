@@ -106,6 +106,7 @@ class WaveletImageOutputs:
     distributions: torch.Tensor
     log_energies: torch.Tensor
     total_energies: torch.Tensor
+    brightness: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +117,18 @@ class WaveletReferenceCache:
     distributions: dict[str, torch.Tensor]
     log_energies: dict[str, torch.Tensor]
     total_energies: dict[str, torch.Tensor]
+    brightness: Optional[dict[str, torch.Tensor]]
     metadata: dict[str, Any]
+
+    def require_brightness(self) -> dict[str, torch.Tensor]:
+        """Return cached brightness values or fail with a rebuild hint."""
+        if self.brightness is None:
+            raise ValueError(
+                "The wavelet reference cache does not contain brightness values. "
+                "Rebuild it with build_wavelet_prompt_hash_cache.py before using "
+                "brightness_weight > 0."
+            )
+        return self.brightness
 
 
 def prompt_sha256(prompt: str) -> str:
@@ -170,21 +182,39 @@ def _pad_to_square(image: Image.Image) -> Image.Image:
     return canvas
 
 
-def _image_to_channel_array(image: Image.Image, config: WaveletDescriptorConfig) -> np.ndarray:
-    """Convert a PIL image into a channel-first float array in [0, 1]."""
+def _prepare_descriptor_image(image: Image.Image, config: WaveletDescriptorConfig) -> Image.Image:
+    """Apply the shared wavelet descriptor image preprocessing."""
     image = _pad_to_square(image)
-    image = image.resize((config.image_size, config.image_size), Image.Resampling.BICUBIC)
+    return image.resize((config.image_size, config.image_size), Image.Resampling.BICUBIC)
 
-    if config.color_space == "y":
+
+def _prepared_image_to_channel_array(
+    image: Image.Image,
+    color_space: str,
+) -> np.ndarray:
+    """Convert a prepared PIL image into a channel-first float array in [0, 1]."""
+    if color_space == "y":
         array = np.asarray(image.convert("YCbCr"), dtype=np.float32)[..., :1]
-    elif config.color_space == "rgb":
+    elif color_space == "rgb":
         array = np.asarray(image.convert("RGB"), dtype=np.float32)
-    elif config.color_space == "ycbcr":
+    elif color_space == "ycbcr":
         array = np.asarray(image.convert("YCbCr"), dtype=np.float32)
     else:
-        raise ValueError(f"Unsupported color_space: {config.color_space}")
+        raise ValueError(f"Unsupported color_space: {color_space}")
 
     return np.transpose(array / 255.0, (2, 0, 1))
+
+
+def _image_to_channel_array(image: Image.Image, config: WaveletDescriptorConfig) -> np.ndarray:
+    """Convert a PIL image into a channel-first float array in [0, 1]."""
+    prepared_image = _prepare_descriptor_image(image, config)
+    return _prepared_image_to_channel_array(prepared_image, config.color_space)
+
+
+def _prepared_image_brightness(image: Image.Image) -> float:
+    """Compute mean luma brightness from a prepared PIL image."""
+    y_channel = np.asarray(image.convert("YCbCr"), dtype=np.float32)[..., 0] / 255.0
+    return float(np.mean(y_channel, dtype=np.float64))
 
 
 def _haar_step(channel: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -245,8 +275,10 @@ def extract_wavelet_outputs(
     distributions = []
     log_energies = []
     total_energies = []
+    brightness_values = []
     for image in images:
-        channel_array = _image_to_channel_array(image, config)
+        prepared_image = _prepare_descriptor_image(image, config)
+        channel_array = _prepared_image_to_channel_array(prepared_image, config.color_space)
         raw_energies: list[float] = []
         for channel in channel_array:
             raw_energies.extend(_extract_channel_energies(channel, config))
@@ -260,11 +292,13 @@ def extract_wavelet_outputs(
         distributions.append(distribution)
         log_energies.append(log_energy_tensor)
         total_energies.append(raw_energy_tensor.sum())
+        brightness_values.append(_prepared_image_brightness(prepared_image))
 
     return WaveletImageOutputs(
         distributions=torch.stack(distributions, dim=0),
         log_energies=torch.stack(log_energies, dim=0),
         total_energies=torch.stack(total_energies, dim=0),
+        brightness=torch.tensor(brightness_values, dtype=torch.float32),
     )
 
 
@@ -339,6 +373,24 @@ def total_energy_similarity(
     return torch.exp(-distance / tau)
 
 
+def brightness_similarity(
+    generated_brightness: torch.Tensor,
+    reference_brightness: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    """Compare whole-image brightness with an exponential L1 kernel."""
+    if tau <= 0:
+        raise ValueError(f"brightness_tau must be positive, got {tau}.")
+    if generated_brightness.shape != reference_brightness.shape:
+        raise ValueError(
+            "Brightness shape mismatch: "
+            f"generated={tuple(generated_brightness.shape)} "
+            f"reference={tuple(reference_brightness.shape)}"
+        )
+    distance = torch.abs(generated_brightness - reference_brightness)
+    return torch.exp(-distance / tau)
+
+
 def wavelet_similarity_reward(
     generated_outputs: WaveletImageOutputs,
     reference_outputs: WaveletImageOutputs,
@@ -346,10 +398,14 @@ def wavelet_similarity_reward(
     score_type: str,
     distribution_weight: float,
     total_energy_tau: float,
+    brightness_weight: float = 0.0,
+    brightness_tau: float = 0.08,
 ) -> torch.Tensor:
     """Compute the final wavelet similarity reward."""
     if not 0.0 <= distribution_weight <= 1.0:
         raise ValueError(f"distribution_weight must be in [0, 1], got {distribution_weight}.")
+    if not 0.0 <= brightness_weight <= 1.0:
+        raise ValueError(f"brightness_weight must be in [0, 1], got {brightness_weight}.")
 
     if score_type == "bhattacharyya":
         distribution_score = bhattacharyya_score(
@@ -374,7 +430,19 @@ def wavelet_similarity_reward(
         reference_outputs.total_energies,
         tau=total_energy_tau,
     )
-    return distribution_weight * distribution_score + (1.0 - distribution_weight) * energy_score
+    base_score = (
+        distribution_weight * distribution_score + (1.0 - distribution_weight) * energy_score
+    )
+    if brightness_weight == 0.0:
+        return base_score
+    if generated_outputs.brightness is None or reference_outputs.brightness is None:
+        raise ValueError("brightness_weight > 0 requires brightness values in both outputs.")
+    brightness_score = brightness_similarity(
+        generated_outputs.brightness,
+        reference_outputs.brightness,
+        tau=brightness_tau,
+    )
+    return (1.0 - brightness_weight) * base_score + brightness_weight * brightness_score
 
 
 def save_reference_cache(
@@ -394,11 +462,25 @@ def save_reference_cache(
     total_energies = torch.stack(
         [outputs_by_hash[prompt_hash].total_energies.squeeze(0) for prompt_hash in prompt_hashes]
     )
+    missing_brightness = [
+        prompt_hash
+        for prompt_hash in prompt_hashes
+        if outputs_by_hash[prompt_hash].brightness is None
+    ]
+    if missing_brightness:
+        raise ValueError(
+            "Cannot save a brightness-aware wavelet cache because output brightness is missing "
+            f"for prompt hash {missing_brightness[0]}."
+        )
+    brightness_values = torch.stack(
+        [outputs_by_hash[prompt_hash].brightness.squeeze(0) for prompt_hash in prompt_hashes]
+    )
     payload: dict[str, Any] = {
         "prompt_hashes": prompt_hashes,
         "distributions": distributions,
         "log_energies": log_energies,
         "total_energies": total_energies,
+        "brightness": brightness_values,
         **metadata,
     }
     torch.save(payload, cache_path)
@@ -425,6 +507,9 @@ def load_reference_cache_payload(cache_path: Path) -> WaveletReferenceCache:
     distributions = torch.as_tensor(payload["distributions"], dtype=torch.float32)
     log_energies = torch.as_tensor(payload["log_energies"], dtype=torch.float32)
     total_energies = torch.as_tensor(payload["total_energies"], dtype=torch.float32)
+    brightness = None
+    if "brightness" in payload:
+        brightness = torch.as_tensor(payload["brightness"], dtype=torch.float32)
 
     if len(prompt_hashes) != distributions.shape[0]:
         raise ValueError(
@@ -441,11 +526,17 @@ def load_reference_cache_payload(cache_path: Path) -> WaveletReferenceCache:
             f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
             f"total_energies rows ({total_energies.shape[0]})."
         )
+    if brightness is not None and len(prompt_hashes) != brightness.shape[0]:
+        raise ValueError(
+            f"Cache prompt_hashes length ({len(prompt_hashes)}) does not match "
+            f"brightness rows ({brightness.shape[0]})."
+        )
 
     metadata = {
         key: value
         for key, value in payload.items()
-        if key not in {"prompt_hashes", "distributions", "log_energies", "total_energies"}
+        if key
+        not in {"prompt_hashes", "distributions", "log_energies", "total_energies", "brightness"}
     }
     return WaveletReferenceCache(
         prompt_hashes=prompt_hashes,
@@ -461,5 +552,13 @@ def load_reference_cache_payload(cache_path: Path) -> WaveletReferenceCache:
             prompt_hash: total_energies[index].reshape(()).detach().cpu()
             for index, prompt_hash in enumerate(prompt_hashes)
         },
+        brightness=(
+            {
+                prompt_hash: brightness[index].reshape(()).detach().cpu()
+                for index, prompt_hash in enumerate(prompt_hashes)
+            }
+            if brightness is not None
+            else None
+        ),
         metadata=metadata,
     )

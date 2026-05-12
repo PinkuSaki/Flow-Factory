@@ -199,7 +199,7 @@ def build_cache(args: argparse.Namespace) -> None:
             "prompt_field": args.prompt_field,
             "image_field": args.image_field,
             "reference_jsonl": str(args.reference_jsonl),
-            "cache_fields": ["distributions", "log_energies", "total_energies"],
+            "cache_fields": ["distributions", "log_energies", "total_energies", "brightness"],
         },
     )
     LOGGER.info("Saved Haar wavelet reference cache to %s", args.cache_path)
