@@ -37,7 +37,7 @@ import base64
 import io
 import logging
 from urllib.parse import urlparse
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 import torch
@@ -56,8 +56,10 @@ logger = logging.getLogger(__name__)
 
 # ======================== Serialization Helpers ========================
 
-def _image_to_b64(img: Union[Image.Image, torch.Tensor]) -> str:
+def _image_to_b64(img: Union[Image.Image, torch.Tensor, str]) -> str:
     """Convert PIL Image or Tensor to base64 string."""
+    if isinstance(img, str):
+        return img
     if isinstance(img, torch.Tensor):
         # (C, H, W) in [0, 1] -> PIL
         arr = (img.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
@@ -67,11 +69,13 @@ def _image_to_b64(img: Union[Image.Image, torch.Tensor]) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _video_to_b64(video: Union[List[Image.Image], torch.Tensor]) -> List[str]:
+def _video_to_b64(video: Union[List[Image.Image], List[str], torch.Tensor]) -> List[str]:
     """Convert video frames to list of base64 strings."""
     if isinstance(video, torch.Tensor):
         # (T, C, H, W) -> list of frames
         return [_image_to_b64(frame) for frame in video]
+    if video and isinstance(video[0], str):
+        return list(video)
     return [_image_to_b64(frame) for frame in video]
 
 
@@ -94,6 +98,35 @@ def _build_payload(
             [_video_to_b64(v) for v in vs] for vs in condition_videos
         ] if condition_videos else None,
     }
+
+
+def serialize_remote_image(img: Union[Image.Image, torch.Tensor, str]) -> str:
+    """Serialize one image for a remote reward server."""
+    return _image_to_b64(img)
+
+
+def serialize_remote_video(
+    video: Union[List[Image.Image], List[str], torch.Tensor],
+) -> List[str]:
+    """Serialize one video for a remote reward server."""
+    return _video_to_b64(video)
+
+
+def build_remote_payload(
+    prompt: List[str],
+    image: Optional[List] = None,
+    video: Optional[List] = None,
+    condition_images: Optional[List[List]] = None,
+    condition_videos: Optional[List[List]] = None,
+) -> Dict[str, Any]:
+    """Build a JSON-serializable request payload for a remote reward server."""
+    return _build_payload(
+        prompt=prompt,
+        image=image,
+        video=video,
+        condition_images=condition_images,
+        condition_videos=condition_videos,
+    )
 
 
 # ======================== Remote Client ========================
@@ -173,10 +206,13 @@ class RemoteRewardClient:
         condition_videos: Optional[List[List]] = None,
     ) -> List[float]:
         """Send compute request and return rewards."""
-        payload = _build_payload(
+        payload = build_remote_payload(
             prompt, image, video, condition_images, condition_videos
         )
+        return self.compute_payload(payload)
 
+    def compute_payload(self, payload: Dict[str, Any]) -> List[float]:
+        """Send a pre-serialized compute payload and return rewards."""
         for attempt in range(self.retries):
             try:
                 with self._make_session() as session:
@@ -244,6 +280,13 @@ class RemotePointwiseRewardModel(PointwiseRewardModel):
         """Signal the remote server to offload the reward model to CPU."""
         return self.client.offload_model()
 
+    def compute_payload(self, payload: Dict[str, Any]) -> RewardModelOutput:
+        """Compute rewards from an already JSON-serializable payload."""
+        rewards = self.client.compute_payload(payload)
+        return RewardModelOutput(
+            rewards=torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        )
+
     @torch.no_grad()
     def __call__(
         self,
@@ -279,6 +322,7 @@ class RemoteGroupwiseRewardModel(GroupwiseRewardModel):
 
     required_fields: Tuple[str, ...] = ("prompt", "image") # Corresponds to the expected input kwargs
     use_tensor_inputs: bool = False
+    is_remote_reward: bool = True
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -296,6 +340,13 @@ class RemoteGroupwiseRewardModel(GroupwiseRewardModel):
         if not self.client.health_check():
             raise RuntimeError(f"Cannot connect to reward server at {server_url}")
         logger.info(f"Connected to reward server at {server_url}")
+
+    def compute_payload(self, payload: Dict[str, Any]) -> RewardModelOutput:
+        """Compute rewards from an already JSON-serializable payload."""
+        rewards = self.client.compute_payload(payload)
+        return RewardModelOutput(
+            rewards=torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        )
 
     @torch.no_grad()
     def __call__(

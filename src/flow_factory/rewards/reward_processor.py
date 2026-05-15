@@ -34,12 +34,119 @@ from .abc import (
     GroupwiseRewardModel,
     RewardModelOutput,
 )
+from .my_reward_remote import serialize_remote_image, serialize_remote_video
 from ..hparams import RewardArguments
 from ..samples import BaseSample
 from ..utils.dist import gather_samples
 from ..utils.base import filter_kwargs
 from ..utils.image import standardize_image_batch
 from ..utils.video import standardize_video_batch
+
+
+_REMOTE_PAYLOAD_FIELDS = (
+    'prompt',
+    'image',
+    'video',
+    'condition_images',
+    'condition_videos',
+)
+
+
+class _RemoteSerializedPayloadCache:
+    """Lazily encode sample media once and slice JSON payloads for remote rewards."""
+
+    def __init__(self, samples: List[BaseSample]):
+        self.samples = samples
+        self._raw_fields: Dict[str, List[Any]] = {}
+        self._serialized_fields: Dict[str, List[Any]] = {}
+
+    def _get_raw_field(self, field_name: str) -> List[Any]:
+        if field_name not in self._raw_fields:
+            values = []
+            for sample in self.samples:
+                try:
+                    values.append(getattr(sample, field_name))
+                except AttributeError:
+                    values.append(None)
+            self._raw_fields[field_name] = values
+        return self._raw_fields[field_name]
+
+    def _require_slice(self, field_name: str, start: int, end: int) -> None:
+        values = self._get_raw_field(field_name)
+        missing = [index for index in range(start, end) if values[index] is None]
+        if missing:
+            raise ValueError(
+                f"Remote reward required field {field_name!r} is missing for "
+                f"{len(missing)} sample(s), first local index: {missing[0]}."
+            )
+
+    def _serialize_field(self, field_name: str) -> List[Any]:
+        if field_name in self._serialized_fields:
+            return self._serialized_fields[field_name]
+
+        values = self._get_raw_field(field_name)
+        if field_name == 'prompt':
+            serialized = [str(value) if value is not None else None for value in values]
+        elif field_name == 'image':
+            serialized = [
+                serialize_remote_image(value) if value is not None else None
+                for value in values
+            ]
+        elif field_name == 'video':
+            serialized = [
+                serialize_remote_video(value) if value is not None else None
+                for value in values
+            ]
+        elif field_name == 'condition_images':
+            serialized = [
+                self._serialize_condition_images(value) if value is not None else None
+                for value in values
+            ]
+        elif field_name == 'condition_videos':
+            serialized = [
+                self._serialize_condition_videos(value) if value is not None else None
+                for value in values
+            ]
+        else:
+            raise ValueError(f"Unsupported remote payload field: {field_name}")
+
+        self._serialized_fields[field_name] = serialized
+        return serialized
+
+    @staticmethod
+    def _serialize_condition_images(value: Any) -> List[str]:
+        images = standardize_image_batch(value, output_type='pt')
+        return [serialize_remote_image(image) for image in images]
+
+    @staticmethod
+    def _serialize_condition_videos(value: Any) -> List[List[str]]:
+        videos = standardize_video_batch(value, output_type='pt')
+        return [serialize_remote_video(video) for video in videos]
+
+    def build_payload(
+        self,
+        start: int,
+        end: int,
+        field_names: Tuple[str, ...],
+    ) -> Dict[str, Any]:
+        """Build one pre-serialized payload slice for a remote reward request."""
+        requested_fields = set(field_names)
+        unsupported = requested_fields - set(_REMOTE_PAYLOAD_FIELDS)
+        if unsupported:
+            raise ValueError(
+                f"Remote reward payload serialization does not support fields: "
+                f"{sorted(unsupported)}."
+            )
+
+        payload: Dict[str, Any] = {}
+        for field_name in _REMOTE_PAYLOAD_FIELDS:
+            if field_name not in requested_fields:
+                payload[field_name] = None
+                continue
+            self._require_slice(field_name, start, end)
+            payload[field_name] = self._serialize_field(field_name)[start:end]
+        return payload
+
 
 # ============================ Reward Processor ============================
 class RewardProcessor:
@@ -210,6 +317,52 @@ class RewardProcessor:
             device='cpu', dtype=torch.float32,
         )
 
+    def _remote_required_fields(self, model: BaseRewardModel) -> Tuple[str, ...]:
+        """Return the payload fields used by the remote reward wrapper."""
+        fields = tuple(
+            field for field in model.required_fields if field in _REMOTE_PAYLOAD_FIELDS
+        )
+        if not fields:
+            raise ValueError(
+                f"Remote reward model {type(model).__name__} does not declare any "
+                "supported remote payload fields."
+            )
+        return fields
+
+    def _compute_remote_payload(
+        self,
+        model: PointwiseRewardModel,
+        payload: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Compute a remote reward from an already serialized payload."""
+        compute_payload = getattr(model, 'compute_payload', None)
+        if compute_payload is None:
+            raise TypeError(
+                f"Remote reward model {type(model).__name__} does not support "
+                "pre-serialized payload computation."
+            )
+        output = compute_payload(payload)
+        return torch.as_tensor(
+            output.rewards if hasattr(output, 'rewards') else output,
+            device='cpu',
+            dtype=torch.float32,
+        )
+
+    def _compute_remote_pointwise_batch(
+        self,
+        model: PointwiseRewardModel,
+        payload_cache: _RemoteSerializedPayloadCache,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """Compute a remote pointwise batch while reusing serialized media."""
+        payload = payload_cache.build_payload(
+            start=start,
+            end=end,
+            field_names=self._remote_required_fields(model),
+        )
+        return self._compute_remote_payload(model, payload)
+
     def _gather_sample_counts(self, local_count: int) -> list[int]:
         """Gather per-rank sample counts for distributed reward scatter."""
         if self.accelerator.num_processes <= 1:
@@ -336,6 +489,105 @@ class RewardProcessor:
         all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
         return all_rewards[local_start:local_end].cpu()
 
+    def _compute_main_process_remote_pointwise_rewards(
+        self,
+        models: Dict[str, PointwiseRewardModel],
+        samples: List[BaseSample],
+        epoch: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute main-process remote pointwise rewards with shared serialization."""
+        if not models:
+            return {}
+
+        device = self.accelerator.device
+        rank = self.accelerator.process_index
+
+        required_fields: Set[str] = set()
+        for model in models.values():
+            required_fields.update(self._remote_required_fields(model))
+
+        self.accelerator.wait_for_everyone()
+        gathered = gather_samples(
+            accelerator=self.accelerator,
+            samples=samples,
+            field_names=sorted(required_fields),
+            device=torch.device('cpu'),
+        )
+        sample_counts = self._gather_sample_counts(len(samples))
+        local_start = sum(sample_counts[:rank])
+        local_end = local_start + sample_counts[rank]
+
+        num_gathered = len(gathered)
+        all_rewards_by_name = {
+            name: torch.zeros(num_gathered, dtype=torch.float32, device=device)
+            for name in models
+        }
+        error_message = None
+
+        self._release_cuda_cache_before_remote_reward()
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            payload_cache = _RemoteSerializedPayloadCache(gathered)
+            try:
+                for name, model in models.items():
+                    batch_size = self._resolve_batch_size(name, model)
+                    batch_starts = list(range(0, num_gathered, batch_size))
+                    max_workers = self._resolve_remote_max_concurrent_requests(name, model)
+                    should_offload = self._resolve_remote_offload_after_compute(name, model)
+
+                    try:
+                        if should_offload:
+                            self._signal_remote_lifecycle(model, 'load')
+
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            future_to_span = {}
+                            for start in batch_starts:
+                                end = min(start + batch_size, num_gathered)
+                                payload = payload_cache.build_payload(
+                                    start=start,
+                                    end=end,
+                                    field_names=self._remote_required_fields(model),
+                                )
+                                future = executor.submit(
+                                    self._compute_remote_payload,
+                                    model,
+                                    payload,
+                                )
+                                future_to_span[future] = (start, end)
+
+                            desc = (
+                                f'Epoch {epoch} Remote Pointwise Rewards: {name}'
+                                if epoch is not None
+                                else f'Remote Pointwise Rewards: {name}'
+                            )
+                            with tqdm(
+                                total=len(future_to_span),
+                                desc=desc,
+                                disable=not self.show_progress_bar,
+                            ) as pbar:
+                                for future in as_completed(future_to_span):
+                                    start, end = future_to_span[future]
+                                    reward_tensor = future.result().to(device)
+                                    all_rewards_by_name[name][start:end] = reward_tensor
+                                    pbar.update(1)
+                    finally:
+                        if should_offload:
+                            self._signal_remote_lifecycle(model, 'offload')
+            except Exception as exc:  # noqa: BLE001
+                error_message = f"Remote reward computation failed on main process: {exc}"
+
+        error_message = self._broadcast_main_process_object(error_message)
+        if error_message is not None:
+            raise RuntimeError(error_message)
+
+        return {
+            name: self.accelerator.reduce(all_rewards, reduction='sum')[
+                local_start:local_end
+            ].cpu()
+            for name, all_rewards in all_rewards_by_name.items()
+        }
+
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]
     ) -> torch.Tensor:
@@ -406,16 +658,26 @@ class RewardProcessor:
         """Compute rewards for PointwiseRewardModels."""
         models = models if models is not None else self._pointwise_models
         results: Dict[str, torch.Tensor] = {}
+        main_process_remote_models = {
+            name: model
+            for name, model in models.items()
+            if self._resolve_remote_dispatch_mode(name, model) == 'main_process'
+        }
+        main_process_remote_results: Optional[Dict[str, torch.Tensor]] = None
+        local_remote_payload_cache: Optional[_RemoteSerializedPayloadCache] = None
         
         for name, model in models.items():
             dispatch_mode = self._resolve_remote_dispatch_mode(name, model)
             if dispatch_mode == 'main_process':
-                results[name] = self._compute_main_process_remote_pointwise_reward(
-                    name=name,
-                    model=model,
-                    samples=samples,
-                    epoch=epoch,
-                )
+                if main_process_remote_results is None:
+                    main_process_remote_results = (
+                        self._compute_main_process_remote_pointwise_rewards(
+                            models=main_process_remote_models,
+                            samples=samples,
+                            epoch=epoch,
+                        )
+                    )
+                results[name] = main_process_remote_results[name]
                 continue
 
             rewards = []
@@ -429,7 +691,17 @@ class RewardProcessor:
             )
             for i in pbar:
                 batch_samples = samples[i : i + batch_size]
-                reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
+                if getattr(model, 'is_remote_reward', False):
+                    if local_remote_payload_cache is None:
+                        local_remote_payload_cache = _RemoteSerializedPayloadCache(samples)
+                    reward_tensor = self._compute_remote_pointwise_batch(
+                        model=model,
+                        payload_cache=local_remote_payload_cache,
+                        start=i,
+                        end=i + len(batch_samples),
+                    )
+                else:
+                    reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
                 rewards.append(reward_tensor)
             
             results[name] = torch.cat(rewards, dim=0)
