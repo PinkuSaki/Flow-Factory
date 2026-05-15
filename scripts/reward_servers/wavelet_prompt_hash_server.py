@@ -88,21 +88,6 @@ def parse_args() -> argparse.Namespace:
         help="Temperature for total wavelet energy log-ratio similarity.",
     )
     parser.add_argument(
-        "--brightness-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight for whole-image brightness similarity. Set to 0 to preserve the "
-            "original wavelet-only reward behavior."
-        ),
-    )
-    parser.add_argument(
-        "--brightness-tau",
-        type=float,
-        default=0.08,
-        help="Temperature for whole-image brightness L1 similarity.",
-    )
-    parser.add_argument(
         "--num-workers",
         type=int,
         default=1,
@@ -209,14 +194,10 @@ def _concat_wavelet_outputs(outputs: list[WaveletImageOutputs]) -> WaveletImageO
     """Concatenate wavelet output shards in request order."""
     if not outputs:
         raise ValueError("At least one wavelet output shard is required.")
-    brightness_values = [output.brightness for output in outputs]
-    if any(value is None for value in brightness_values):
-        raise ValueError("All wavelet output shards must contain brightness values.")
     return WaveletImageOutputs(
         distributions=torch.cat([output.distributions for output in outputs], dim=0),
         log_energies=torch.cat([output.log_energies for output in outputs], dim=0),
         total_energies=torch.cat([output.total_energies for output in outputs], dim=0),
-        brightness=torch.cat(brightness_values, dim=0),
     )
 
 
@@ -229,16 +210,12 @@ class WaveletPromptHashService:
         score_type: str,
         distribution_weight: float,
         total_energy_tau: float,
-        brightness_weight: float,
-        brightness_tau: float,
         num_workers: int,
     ) -> None:
         self.cache_path = cache_path
         self.score_type = score_type
         self.distribution_weight = distribution_weight
         self.total_energy_tau = total_energy_tau
-        self.brightness_weight = brightness_weight
-        self.brightness_tau = brightness_tau
         self.num_workers = num_workers
         self.reference_cache = load_reference_cache_payload(cache_path)
         self.descriptor_config = WaveletDescriptorConfig.from_metadata(
@@ -246,19 +223,6 @@ class WaveletPromptHashService:
         )
         if self.num_workers <= 0:
             raise ValueError(f"num_workers must be positive, got {self.num_workers}.")
-        if not 0.0 <= self.distribution_weight <= 1.0:
-            raise ValueError(
-                f"distribution_weight must be in [0, 1], got {self.distribution_weight}."
-            )
-        if self.total_energy_tau <= 0:
-            raise ValueError(f"total_energy_tau must be positive, got {self.total_energy_tau}.")
-        if not 0.0 <= self.brightness_weight <= 1.0:
-            raise ValueError(f"brightness_weight must be in [0, 1], got {self.brightness_weight}.")
-        if self.brightness_tau <= 0:
-            raise ValueError(f"brightness_tau must be positive, got {self.brightness_tau}.")
-        if self.brightness_weight > 0.0:
-            self.reference_cache.require_brightness()
-
         self.process_pool: Optional[ProcessPoolExecutor] = None
         if self.num_workers > 1:
             self.process_pool = ProcessPoolExecutor(max_workers=self.num_workers)
@@ -266,6 +230,13 @@ class WaveletPromptHashService:
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0
         self._loaded = False
+
+        if not 0.0 <= self.distribution_weight <= 1.0:
+            raise ValueError(
+                f"distribution_weight must be in [0, 1], got {self.distribution_weight}."
+            )
+        if self.total_energy_tau <= 0:
+            raise ValueError(f"total_energy_tau must be positive, got {self.total_energy_tau}.")
 
         LOGGER.info(
             "Loaded %s wavelet reference entries from %s",
@@ -275,8 +246,7 @@ class WaveletPromptHashService:
         LOGGER.info(
             "Wavelet prompt-hash config: image_size=%s levels=%s color_space=%s "
             "include_approximation=%s level_weight_decay=%s score_type=%s "
-            "distribution_weight=%s total_energy_tau=%s brightness_weight=%s "
-            "brightness_tau=%s num_workers=%s",
+            "distribution_weight=%s total_energy_tau=%s num_workers=%s",
             self.descriptor_config.image_size,
             self.descriptor_config.levels,
             self.descriptor_config.color_space,
@@ -285,8 +255,6 @@ class WaveletPromptHashService:
             self.score_type,
             self.distribution_weight,
             self.total_energy_tau,
-            self.brightness_weight,
-            self.brightness_tau,
             self.num_workers,
         )
 
@@ -315,11 +283,6 @@ class WaveletPromptHashService:
 
     def _build_reference_outputs(self, prompt_hashes: list[str]) -> WaveletImageOutputs:
         """Stack cached reference descriptors for one compute request."""
-        reference_brightness = None
-        if self.reference_cache.brightness is not None:
-            reference_brightness = torch.stack(
-                [self.reference_cache.brightness[prompt_hash] for prompt_hash in prompt_hashes]
-            )
         return WaveletImageOutputs(
             distributions=torch.stack(
                 [self.reference_cache.distributions[prompt_hash] for prompt_hash in prompt_hashes]
@@ -330,7 +293,6 @@ class WaveletPromptHashService:
             total_energies=torch.stack(
                 [self.reference_cache.total_energies[prompt_hash] for prompt_hash in prompt_hashes]
             ),
-            brightness=reference_brightness,
         )
 
     def _extract_generated_outputs(
@@ -418,8 +380,6 @@ class WaveletPromptHashService:
                 score_type=self.score_type,
                 distribution_weight=self.distribution_weight,
                 total_energy_tau=self.total_energy_tau,
-                brightness_weight=self.brightness_weight,
-                brightness_tau=self.brightness_tau,
             )
             reward_values = rewards.float().tolist()
         finally:
@@ -468,9 +428,6 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "score_type": self.service.score_type,
                     "distribution_weight": self.service.distribution_weight,
                     "total_energy_tau": self.service.total_energy_tau,
-                    "brightness_weight": self.service.brightness_weight,
-                    "brightness_tau": self.service.brightness_tau,
-                    "has_reference_brightness": self.service.reference_cache.brightness is not None,
                     "num_workers": self.service.num_workers,
                     "process_pool": self.service.process_pool is not None,
                     "wavelet": "haar",
@@ -545,8 +502,6 @@ def main() -> None:
         score_type=args.score_type,
         distribution_weight=args.distribution_weight,
         total_energy_tau=args.total_energy_tau,
-        brightness_weight=args.brightness_weight,
-        brightness_tau=args.brightness_tau,
         num_workers=args.num_workers,
     )
 
