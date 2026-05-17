@@ -177,6 +177,25 @@ def soft_jaccard_score(
     return intersection / union.clamp_min(eps)
 
 
+def negative_binary_cross_entropy_score(
+    generated_probabilities: torch.Tensor,
+    reference_probabilities: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute negative mean binary cross entropy against reference probabilities."""
+    if generated_probabilities.shape != reference_probabilities.shape:
+        raise ValueError(
+            "Probability shape mismatch: "
+            f"generated={tuple(generated_probabilities.shape)} "
+            f"reference={tuple(reference_probabilities.shape)}"
+        )
+
+    generated = generated_probabilities.clamp(min=eps, max=1.0 - eps)
+    reference = reference_probabilities.clamp(min=0.0, max=1.0)
+    loss = F.binary_cross_entropy(generated, reference, reduction="none").mean(dim=-1)
+    return -loss
+
+
 def wd_distribution_reward(
     real_probabilities: torch.Tensor,
     fake_probabilities: torch.Tensor,

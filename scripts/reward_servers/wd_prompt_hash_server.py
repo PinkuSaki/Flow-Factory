@@ -46,6 +46,7 @@ from process_worker_pool import ProcessWorkerPool
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
     load_reference_cache_payload,
+    negative_binary_cross_entropy_score,
     prompt_sha256,
     soft_jaccard_score,
     wd_distribution_reward,
@@ -73,12 +74,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--score-type",
-        choices=("embedding_cosine", "soft_jaccard", "wd_distribution"),
+        choices=("embedding_cosine", "soft_jaccard", "wd_distribution", "negative_bce"),
         default="embedding_cosine",
         help=(
             "Reward score to compute. embedding_cosine preserves the original normalized "
             "feature cosine reward; soft_jaccard compares WD class probability vectors; "
-            "wd_distribution combines weighted recall and weighted soft Jaccard."
+            "wd_distribution combines weighted recall and weighted soft Jaccard; "
+            "negative_bce returns negative mean binary cross entropy over WD probabilities."
         ),
     )
     parser.add_argument(
@@ -227,6 +229,15 @@ class WDEVA02PromptHashProcessWorker:
                 real_probabilities=reference_probabilities,
                 fake_probabilities=generated_outputs.probabilities,
             )
+        elif self.score_type == "negative_bce":
+            reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+            reference_probabilities = torch.stack(
+                [reference_probabilities_by_hash[prompt_hash] for prompt_hash in prompt_hashes]
+            )
+            rewards = negative_binary_cross_entropy_score(
+                generated_outputs.probabilities,
+                reference_probabilities,
+            )
         else:
             raise ValueError(f"Unsupported score_type: {self.score_type}")
         return rewards.float().tolist()
@@ -262,7 +273,7 @@ class WDEVA02PromptHashService:
         self._loaded_on_device = False
 
         self.reference_cache = load_reference_cache_payload(cache_path)
-        if self.score_type in {"soft_jaccard", "wd_distribution"}:
+        if self.score_type in {"soft_jaccard", "wd_distribution", "negative_bce"}:
             self.reference_cache.require_probabilities()
         if self.process_pool_enabled:
             self.encoder: Optional[WDEVA02EmbeddingModel] = None
@@ -475,6 +486,18 @@ class WDEVA02PromptHashService:
                     rewards_tensor = wd_distribution_reward(
                         real_probabilities=reference_probabilities,
                         fake_probabilities=generated_outputs.probabilities,
+                    )
+                elif self.score_type == "negative_bce":
+                    reference_probabilities_by_hash = self.reference_cache.require_probabilities()
+                    reference_probabilities = torch.stack(
+                        [
+                            reference_probabilities_by_hash[prompt_hash]
+                            for prompt_hash in prompt_hashes
+                        ]
+                    )
+                    rewards_tensor = negative_binary_cross_entropy_score(
+                        generated_outputs.probabilities,
+                        reference_probabilities,
                     )
                 else:
                     raise ValueError(f"Unsupported score_type: {self.score_type}")
