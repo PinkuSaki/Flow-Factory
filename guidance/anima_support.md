@@ -91,6 +91,7 @@ Updated example files:
 - `examples/nft/lora/anima/default.yaml`
 - `examples/awm/lora/anima/default.yaml`
 - `examples/awm/lora/anima/single_gpu_smoke.yaml`
+- `examples/awm/lora/anima/multi_gpu_deepspeed_zero2_smoke.yaml`
 - `examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml`
 - `examples/grpo/lora/anima/anime_custom.yaml`
 
@@ -522,7 +523,7 @@ Validated:
 - `GeneralDataset(..., split="train", enable_preprocess=False)` loads `4033` records
 - `GeneralDataset(..., split="test", enable_preprocess=False)` loads `16` records
 
-### 14. Upstream merge AWM smoke and multi-GPU preparation
+### 14. Upstream merge AWM smoke and multi-GPU validation
 
 Date: July 11, 2026
 
@@ -546,12 +547,46 @@ Observed results:
 - optimizer steps completed: `1`
 - process exit code: `0`
 
-The follow-up config is `examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml`.
-It resolves to four processes, `group_contiguous` sampling, two local batches per
-rank, and two gradient-accumulation steps. The adapter now exposes Anima `Block`
-and `LLMAdapterTransformerBlock` as FSDP no-split module classes so Accelerate can
-wrap repeated blocks rather than the whole transformer as one unit. The multi-GPU
-run remains pending because this host has one GPU.
+The multi-GPU follow-up ran on two NVIDIA RTX 4080 SUPER GPUs with both supported
+sharded backends.
+
+DeepSpeed ZeRO-2 validation used
+`examples/awm/lora/anima/multi_gpu_deepspeed_zero2_smoke.yaml` and the three remote
+rewards on ports `18082`, `18084`, and `18085`:
+
+- world size: `2`
+- sampler: `group_contiguous`
+- geometry: `unique_sample_num_per_epoch=2`, `group_size=2`,
+  `per_device_batch_size=1`, `num_batches_per_epoch=2`,
+  `gradient_accumulation_steps=2`
+- epoch reward means: `1.3588`, `1.3759`
+- epoch gradient norms: `0.0018`, `0.0038`
+- optimizer steps completed: `2`
+- changed LoRA tensors between checkpoint 0 and checkpoint 1: `280 / 560`
+- total checkpoint absolute parameter delta: `93.5718`
+- maximum single-element parameter delta: `2.0027e-5`
+- process exit code: `0`
+
+FSDP2 validation used `examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml` and
+Aesthetic Shadow on port `18081`:
+
+- world size: `2`
+- sampler: `group_contiguous`
+- geometry: `unique_sample_num_per_epoch=4`, `group_size=2`,
+  `per_device_batch_size=1`, `num_batches_per_epoch=4`,
+  `gradient_accumulation_steps=4`
+- generated sample count: `8`
+- Aesthetic Shadow reward mean/std: `0.4691 / 0.2378`
+- advantage range: `[-0.6817, 0.6817]`
+- logged grad norm: `0.0049`
+- optimizer steps completed: `1`
+- process exit code: `0`
+
+The adapter exposes Anima `Block` and `LLMAdapterTransformerBlock` as FSDP no-split
+module classes, and the FSDP2 run confirmed that Accelerate can wrap and train the
+repeated blocks without a collective mismatch or rank hang. All multi-process reward
+services also completed load, compute, offload, and Ctrl-C shutdown without leaving
+worker processes or GPU allocations behind.
 
 ## Notes and Current Limits
 

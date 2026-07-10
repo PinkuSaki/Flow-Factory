@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
 import traceback
@@ -270,6 +271,7 @@ def _worker_loop(
     worker_kwargs: dict[str, Any],
 ) -> None:
     """Run one long-lived worker process."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     worker = None
     try:
         torch.cuda.set_device(local_rank)

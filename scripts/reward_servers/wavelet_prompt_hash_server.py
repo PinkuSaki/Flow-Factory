@@ -32,6 +32,7 @@ import argparse
 import base64
 import json
 import logging
+import signal
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -53,6 +54,11 @@ from wavelet_prompt_hash_common import (
 )
 
 LOGGER = logging.getLogger("wavelet_prompt_hash_server")
+
+
+def _ignore_sigint_in_worker() -> None:
+    """Let the parent process handle Ctrl-C and shut worker processes down cleanly."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,7 +231,10 @@ class WaveletPromptHashService:
             raise ValueError(f"num_workers must be positive, got {self.num_workers}.")
         self.process_pool: Optional[ProcessPoolExecutor] = None
         if self.num_workers > 1:
-            self.process_pool = ProcessPoolExecutor(max_workers=self.num_workers)
+            self.process_pool = ProcessPoolExecutor(
+                max_workers=self.num_workers,
+                initializer=_ignore_sigint_in_worker,
+            )
 
         self._condition = threading.Condition(threading.Lock())
         self._active_compute_count = 0

@@ -1,11 +1,14 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/shadow_server.py \
+# Run each reward server in a separate terminal. The defaults below match this two-GPU host.
+
+CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/shadow_server.py \
     --host 127.0.0.1 \
     --port 18081 \
+    --model-path /root/reward_models/aesthetic-shadow-v2-backup \
     --device cuda \
     --dtype bfloat16 \
     --score-type prob_hq
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/wd_prompt_hash_server.py \
+CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/wd_prompt_hash_server.py \
     --host 127.0.0.1 \
     --port 18082 \
     --model-path /root/reward_models/wd-eva02-large-tagger-v3 \
@@ -14,9 +17,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/wd_prompt_hash_server
     --dtype bfloat16 \
     --score-type embedding_cosine
 
-embedding_cosine、soft_jaccard、wd_distribution、negative_bce
+# WD score types: embedding_cosine, soft_jaccard, wd_distribution, negative_bce.
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/anime_aesthetic_server.py \
+CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/anime_aesthetic_server.py \
     --host 127.0.0.1 \
     --port 18083 \
     --model-path /root/reward_models/anime_aesthetic/swinv2pv3_v0_448_ls0.2_x \
@@ -24,37 +27,44 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/anime_aesthetic_serve
     --dtype bfloat16 \
     --score-type percentile
 
-
 python scripts/reward_servers/wavelet_prompt_hash_server.py \
-  --host 127.0.0.1 \
-  --port 18084 \
-  --cache-path dataset/anime_custom_artist_eval16/wavelet_prompt_hash_cache.pt \
-  --score-type bhattacharyya \
-  --distribution-weight 0.8 \
-  --total-energy-tau 1.0 \
-  --num-workers 16
+    --host 127.0.0.1 \
+    --port 18084 \
+    --cache-path dataset/anime_custom_artist_eval16/wavelet_prompt_hash_cache.pt \
+    --score-type bhattacharyya \
+    --distribution-weight 0.8 \
+    --total-energy-tau 1.0 \
+    --num-workers 16
 
 python scripts/reward_servers/luminance_quantile_prompt_hash_server.py \
-  --host 127.0.0.1 \
-  --port 18086 \
-  --cache-path dataset/anime_custom_artist_eval16/luminance_quantile_prompt_hash_cache.pt \
-  --num-workers 16
+    --host 127.0.0.1 \
+    --port 18086 \
+    --cache-path dataset/anime_custom_artist_eval16/luminance_quantile_prompt_hash_cache.pt \
+    --num-workers 16
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/reward_servers/wd_convnext_perceptual_server.py \
-  --host 127.0.0.1 \
-  --port 18085 \
-  --model-path /root/reward_models/wd-convnext-tagger-v3 \
-  --cache-path dataset/anime_custom_artist_eval16/wd_convnext_perceptual_cache.pt \
-  --enable-process-pool
+CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/wd_convnext_perceptual_server.py \
+    --host 127.0.0.1 \
+    --port 18085 \
+    --model-path /root/reward_models/wd-convnext-tagger-v3 \
+    --cache-path dataset/anime_custom_artist_eval16/wd_convnext_perceptual_cache.pt \
+    --enable-process-pool
 
+# Optional destructive cache reset. Uncomment only when rebuilding both caches intentionally.
+# rm -rf /root/.cache/huggingface
+# rm -rf /root/.cache/flow_factory/datasets
 
-
-rm -rf /root/.cache/huggingface
-rm -rf /root/.cache/flow_factory/datasets
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
+# Start ports 18082, 18084, and 18085 before running the validated ZeRO-2 smoke test.
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --config_file config/deepspeed/deepspeed_zero2.yaml \
-    --num_processes 4 \
+    --num_processes 2 \
     --num_machines 1 \
     --mixed_precision bf16 \
-    -m flow_factory.train examples/awm/lora/anima48.yaml
+    -m flow_factory.train examples/awm/lora/anima/multi_gpu_deepspeed_zero2_smoke.yaml
+
+# Full artist multi-reward training uses the same launcher and reward services.
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+    --config_file config/deepspeed/deepspeed_zero2.yaml \
+    --num_processes 2 \
+    --num_machines 1 \
+    --mixed_precision bf16 \
+    -m flow_factory.train examples/awm/lora/anima/artist_multi_reward.yaml

@@ -118,6 +118,22 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Prompt preprocessing and denoising must derive CFG from the same public field and threshold so cached conditioning matches runtime behavior.
 - **Related Constraint**: #12
 
+### [Reward Workers Must Ignore Terminal SIGINT]
+- **Date**: 2026-07-11
+- **Symptom**: Stopping a multi-process reward server with Ctrl-C printed one `KeyboardInterrupt` traceback per worker even though the parent server exited successfully.
+- **Root Cause**: CUDA workers and Wavelet `ProcessPoolExecutor` workers inherited the terminal SIGINT handler instead of letting the parent own service shutdown.
+- **Fix**: Updated `scripts/reward_servers/process_worker_pool.py` to ignore SIGINT in persistent CUDA workers and added the same worker initializer to `wavelet_prompt_hash_server.py`.
+- **Lesson**: Worker processes managed by a parent lifecycle must ignore interactive termination signals so the parent can send explicit shutdown messages and release resources cleanly.
+- **Related Constraint**: N/A
+
+### [Operational Commands Must Follow Example Reorganization]
+- **Date**: 2026-07-11
+- **Symptom**: The Anima command file referenced the removed `examples/awm/lora/anima48.yaml` path and requested four GPUs on a two-GPU host, so the documented launch could not start.
+- **Root Cause**: The example configuration moved to the model-specific directory during the upstream merge, but the operational command file was not updated with the new path or tested topology.
+- **Fix**: Updated `command.txt`, added a tested two-GPU DeepSpeed ZeRO-2 smoke config, and aligned the FSDP2 smoke config with the available two-GPU topology.
+- **Lesson**: Example moves must update both documentation links and operator command files, and distributed launch examples must have a reproducible smoke variant for the target topology.
+- **Related Constraint**: #29
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

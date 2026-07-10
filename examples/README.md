@@ -26,10 +26,13 @@ ff-train examples/grpo/lora/flux1/default.yaml
 
 **Anima AWM smoke tests**:
 ```bash
-# Start the CPU Aesthetic Shadow service described in guidance/anima_support.md first.
+# Start the Aesthetic Shadow service described in command.txt first.
 ff-train examples/awm/lora/anima/single_gpu_smoke.yaml
 
-# Four-GPU FSDP2 follow-up using the same model, dataset, and reward endpoint.
+# Start reward services on ports 18082, 18084, and 18085 for the ZeRO-2 test.
+ff-train examples/awm/lora/anima/multi_gpu_deepspeed_zero2_smoke.yaml
+
+# Two-GPU FSDP2 follow-up using Aesthetic Shadow on port 18081.
 ff-train examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml
 ```
 
