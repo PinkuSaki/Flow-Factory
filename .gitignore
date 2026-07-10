@@ -110,6 +110,8 @@ dataset/**/.gitattributes
 # Local generated custom datasets
 dataset/anime_custom/
 dataset/anime_custom_single_gpu_eval8/
+dataset/anime_custom_single_gpu_eval16/
+dataset/anime_custom_artist_eval16/
 
 # Image data
 dataset/**/image/
