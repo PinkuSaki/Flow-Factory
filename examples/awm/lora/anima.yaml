@@ -7,28 +7,28 @@ mixed_precision: "bf16"
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/anime_custom_single_gpu_eval8"
+  dataset_dir: "dataset/anime_custom_single_gpu_eval16"
   preprocessing_batch_size: 16
   dataloader_num_workers: 8
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: 1024  # Limit train preprocessing time; test split is separately trimmed in dataset_dir.
+  max_dataset_size: 1968  # Limit train preprocessing time; test split is separately trimmed in dataset_dir.
 
 # Model Configuration
 model:
   finetune_type: "lora"  # Options: full, lora
   master_weight_dtype: "bf16"
-  lora_rank: 32
-  lora_alpha: 64
+  lora_rank: 64
+  lora_alpha: 128
   target_components: "transformer"
   target_modules: "default"
-  model_name_or_path: "models/animaOfficial_preview2.safetensors"
+  model_name_or_path: "/root/Flow-Factory/models/anima-base-v1.0.safetensors"
   model_type: "anima"
   qwen3: "models/qwen_3_06b_base.safetensors"
   vae: "models/qwen_image_vae.safetensors"
   t5_tokenizer_path: "tokenizer/t5_old"
   sd_scripts_root: "~/sd-scripts"
-  attn_mode: "sageattn"
+  attn_mode: "flash"
   split_attn: true
   vae_chunk_size: null
   vae_disable_cache: false
@@ -37,33 +37,48 @@ model:
   resume_type: null
 
 log:
-  run_name: "anima_anime_custom_shadow_single_gpu_practical"
+  run_name: "animabase1_20steps_awm_shadow_hq"
   project: "Flow-Factory"
   logging_backend: "tensorboard"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"
-  save_freq: 2
+  save_freq: 1
   save_model_only: true
 
 # Training Configuration
 train:
-  trainer_type: "grpo"
-  advantage_aggregation: "gdpo"
-  clip_range: 1.0e-4
-  adv_clip_range: 5.0
-  kl_type: "v-based"
-  kl_beta: 0
-  ref_param_device: "cuda"  # Save VRAM on a single training GPU.
+  trainer_type: "awm"
+  advantage_aggregation: "sum"  # Options: sum, gdpo
+  off_policy: false
+  awm_weighting: "ghuber"
+  ghuber_power: 0.25
+
+  num_train_timesteps: 6
+  time_sampling_strategy: "discrete_wo_init"  # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_range: 0.9
+
+  clip_range: 1.0
+  adv_clip_range: 1.0
+  kl_weight: "Uniform"
+  kl_type: "v-based"  # Options: x-based, v-based
+  kl_beta: 0.001
+  ref_param_device: "cuda"  # Options: cpu, cuda
+  ema_decay_schedule: "constant"  # Options: constant, power, linear, piecewise_linear, cosine, warmup_cosine
+  ema_kl_beta: 0
+  ema_decay: 0.5
+  ema_update_interval: 1
+  warmup_steps: 0
+  ema_device: "cuda"
   latent_storage_dtype: "bf16"
 
   resolution: 512
-  num_inference_steps: 8
+  num_inference_steps: 20
   guidance_scale: 4.0
 
-  max_epochs: 12
-  per_device_batch_size: 6
-  group_size: 16
-  global_std: false
-  unique_sample_num_per_epoch: 48
+  per_device_batch_size: 8
+  group_size: 8
+  global_std: true
+  unique_sample_num_per_epoch: 32
   gradient_step_per_epoch: 1
 
   learning_rate: 2.0e-5
@@ -71,10 +86,6 @@ train:
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-
-  ema_decay: 0.0
-  ema_update_interval: 1
-  ema_device: "cpu"
 
   enable_gradient_checkpointing: true
   cpu_offload_checkpointing: false
@@ -84,19 +95,15 @@ train:
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "Flow-SDE"
-  noise_level: 1.0
-  num_sde_steps: 1
-  sde_steps: [1, 2, 3]
-  seed: 42
+  dynamics_type: "ODE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
 
 # Evaluation settings
 eval:
-  resolution: 512
-  per_device_batch_size: 4
+  resolution: 1024
+  per_device_batch_size: 2
   guidance_scale: 4.0
   num_inference_steps: 28
-  eval_freq: 2
+  eval_freq: 1
   seed: 42
 
 # Reward Model Configuration
@@ -104,9 +111,12 @@ rewards:
   - name: "aesthetic_shadow"
     reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
     weight: 1.0
-    batch_size: 8
+    batch_size: 256
     device: "cuda"
     dtype: bfloat16
     server_url: "http://127.0.0.1:18081"
-    timeout: 60.0
-    retry_attempts: 3
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 8
+    remote_offload_after_compute: true
+    timeout: 300.0
+    retry_attempts: 1

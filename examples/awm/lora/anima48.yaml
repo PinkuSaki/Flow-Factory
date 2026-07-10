@@ -1,0 +1,146 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: null
+num_processes: 1  # Single-GPU training. Run the shadow reward service on CPU.
+main_process_port: 29505
+mixed_precision: "bf16"
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/anime_custom_artist_eval16"
+  preprocessing_batch_size: 16
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 1968  # Limit train preprocessing time; test split is separately trimmed in dataset_dir.
+
+# Model Configuration
+model:
+  finetune_type: "lora"  # Options: full, lora
+  master_weight_dtype: "bf16"
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: "transformer"
+  target_modules: "default"
+  model_name_or_path: "/root/Flow-Factory/models/animaBase1_ex05.safetensors"
+  model_type: "anima"
+  qwen3: "models/qwen_3_06b_base.safetensors"
+  vae: "models/qwen_image_vae.safetensors"
+  t5_tokenizer_path: "tokenizer/t5_old"
+  sd_scripts_root: "~/sd-scripts"
+  attn_mode: "flash"
+  split_attn: true
+  vae_chunk_size: null
+  vae_disable_cache: false
+  discrete_flow_shift: 1.0
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "animabase1_ex05_custom_awm_05wd_perceptual_wavelet"
+  project: "Flow-Factory"
+  logging_backend: "tensorboard"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"
+  save_freq: 1
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: "awm"
+  advantage_aggregation: "sum"  # Options: sum, gdpo
+  off_policy: false
+  awm_weighting: "ghuber"
+  ghuber_power: 0.25
+
+  num_train_timesteps: 4
+  time_sampling_strategy: "discrete_wo_init"  # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_range: 0.9
+
+  clip_range: 1.0
+  adv_clip_range: 1.0
+  kl_weight: "Uniform"
+  kl_type: "v-based"  # Options: x-based, v-based
+  kl_beta: 0
+  ref_param_device: "cuda"  # Options: cpu, cuda
+  ema_decay_schedule: "constant"  # Options: constant, power, linear, piecewise_linear, cosine, warmup_cosine
+  ema_kl_beta: 0
+  ema_decay: 0
+  ema_update_interval: 1
+  warmup_steps: 0
+  ema_device: "cuda"
+  latent_storage_dtype: "bf16"
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.0
+
+  per_device_batch_size: 8
+  group_size: 16
+  global_std: true
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 1
+
+  learning_rate: 2.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  enable_gradient_checkpointing: true
+  cpu_offload_checkpointing: false
+  unsloth_offload_checkpointing: false
+
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+
+# Evaluation settings
+eval:
+  resolution: 1024
+  per_device_batch_size: 2
+  guidance_scale: 4.0
+  num_inference_steps: 28
+  eval_freq: 1
+  seed: 42
+
+# Reward Model Configuration
+rewards:
+  - name: "wd_reference_similarity"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    weight: 0.5
+    batch_size: 256
+    device: "cuda"
+    dtype: bfloat16
+    server_url: "http://127.0.0.1:18082"
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 8
+    remote_offload_after_compute: true
+    timeout: 300.0
+    retry_attempts: 1
+  - name: "wd_convnext_perceptual"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    weight: 1
+    batch_size: 256
+    device: "cuda"
+    dtype: bfloat16
+    server_url: "http://127.0.0.1:18085"
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 8
+    remote_offload_after_compute: true
+    timeout: 300.0
+    retry_attempts: 1
+  - name: "wavelet_reference_similarity"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    weight: 1
+    batch_size: 256
+    device: "cuda"
+    dtype: bfloat16
+    server_url: "http://127.0.0.1:18084"
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 8
+    remote_offload_after_compute: true
+    timeout: 300.0
+    retry_attempts: 1
