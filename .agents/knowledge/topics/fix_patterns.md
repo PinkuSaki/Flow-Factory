@@ -78,6 +78,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: LLM-based control outputs need bounded prompts and schema-tolerant parsing; production bridges should handle minor format drift without collapsing the training job.
 - **Related Constraint**: N/A
 
+### [Distributed Eval Logging Must Gather Samples]
+- **Date**: 2026-04-28
+- **Symptom**: TensorBoard logged only the main-rank subset of evaluation samples during multi-process training.
+- **Root Cause**: Trainer evaluation loops gathered reward tensors for global statistics but passed rank-local `all_samples` to the logger.
+- **Fix**: Added a lightweight eval sample gather helper in `src/flow_factory/trainers/abc.py` and used it in GRPO, DPO, NFT, and AWM evaluation before main-process logging.
+- **Lesson**: Distributed eval logging needs separate sample gathering; metric gathering alone does not make media logs global.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

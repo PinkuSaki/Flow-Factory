@@ -7,6 +7,24 @@
 - Operator: `Codex`
 - Goal: Run Anima LoRA GRPO training on the custom anime Markdown prompt dataset with remote Aesthetic Shadow as the only active training reward.
 
+## Current Status Update
+
+- Date: `2026-04-26`
+- Scope: update the custom Anima route from the earlier GRPO shadow-only report to the current AWM scaling plan with two remote pointwise rewards.
+- Primary plan: `anima_scaling_plan.md`
+- Primary config: `examples/awm/lora/anima.yaml`
+- Current model checkpoint: `models/animaOfficial_preview3Base.safetensors`
+- Current dataset directory: `dataset/anime_custom_single_gpu_eval16`
+- Current validation host: one visible NVIDIA GeForce RTX 4080 with 32760 MiB VRAM
+- Current active rewards:
+  - `aesthetic_shadow`
+  - `wd_reference_similarity`
+- Current status: single-GPU smoke validation completed; formal long training has not been executed in this update.
+
+The original April 11 sections below are retained as historical GRPO validation
+records. The April 26 AWM route supersedes the old UnifiedReward-Flex route for
+the current custom scaling plan.
+
 ## Environment
 
 - Machine: `/root/Flow-Factory` workspace container
@@ -33,12 +51,28 @@
 - Conversion rule: preserve Markdown formatting and remove only the `Artist` section.
 - Generated dataset artifacts are local-only and intentionally excluded from version control.
 
+Current AWM scaling dataset:
+
+- Source JSONL: `dataset/anime_custom_single_gpu_eval16/anime4k.jsonl`
+- Source records: `4049`
+- Train split: `dataset/anime_custom_single_gpu_eval16/train.jsonl`, `4033` records
+- Test split: `dataset/anime_custom_single_gpu_eval16/test.jsonl`, `16` records
+- Split rule: random 16-record test sample with seed `42`; all remaining records are used for train
+- Train/test overlap: `0`
+- WD prompt-hash cache: `dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt`
+- WD cache coverage: `4049` prompt hashes, matching the full source JSONL
+
 ### Reward Services
 
 - Aesthetic Shadow:
   - Endpoint: `http://127.0.0.1:18081`
   - Command: `CUDA_VISIBLE_DEVICES=0 python scripts/reward_servers/shadow_server.py --host 127.0.0.1 --port 18081 --device cuda --dtype bfloat16 --score-type prob_hq`
   - Score type: `P(hq)`
+- WD prompt-hash reference similarity:
+  - Endpoint: `http://127.0.0.1:18082`
+  - Command: `python scripts/reward_servers/wd_prompt_hash_server.py --host 127.0.0.1 --port 18082 --model-path /root/reward_models/wd-eva02-large-tagger-v3 --cache-path dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt --device cpu --dtype float32`
+  - Runtime behavior: hash each prompt, load the cached reference embedding, encode the generated image, and return cosine similarity
+  - Health check result from April 26 validation: `reference_count=4049`
 - UnifiedReward-Flex (historical validation only, not part of the current training route):
   - Historical validation backend used for the recorded smoke / short metrics:
     - vLLM endpoint: `http://127.0.0.1:18082/v1`
@@ -86,8 +120,11 @@
   - `unique_sample_num_per_epoch: 8`
   - `max_epochs: 1`
 - Current active route:
-  - keep only `aesthetic_shadow`
-  - do not start `UnifiedReward-Flex` for training
+  - use `examples/awm/lora/anima.yaml`
+  - use `aesthetic_shadow`
+  - use `wd_reference_similarity`
+  - do not start `UnifiedReward-Flex` for the current AWM scaling route
+  - set a finite `train.max_epochs` before unattended formal training because the current AWM YAML omits it
 
 ## Validation Runs
 
@@ -139,6 +176,47 @@
 - Image quality notes: `N/A`
 - Notes: The formal YAML is ready, but the current turn stopped after the smoke test and a successful 2-GPU short fallback run.
 
+### April 26 AWM Remote-Reward Smoke
+
+- Date: `2026-04-26`
+- Base config: `examples/awm/lora/anima.yaml`
+- Runtime scale overrides: `max_dataset_size=1`, `resolution=64`, `num_inference_steps=2`, `group_size=2`, `unique_sample_num_per_epoch=1`, `num_train_timesteps=1`, `max_epochs=1`, `eval_freq=0`
+- Active rewards:
+  - `aesthetic_shadow`
+  - `wd_reference_similarity`
+- Outcome: Success. The full `sample -> remote rewards -> advantages -> optimize` loop completed on one GPU with both remote rewards enabled.
+- Reward summary:
+  - `aesthetic_shadow` mean/std: `0.5521295070648193 / 0.12267257273197174`
+  - `wd_reference_similarity` mean/std: `0.1760590374469757 / 0.020329244434833527`
+- Parameter update summary:
+  - `train/adv_min=-1`
+  - `train/adv_max=1`
+  - `train/ratio_min=1`
+  - `train/ratio_max=1`
+  - `train/grad_norm=0.0173`
+  - optimizer steps completed: `1`
+- Notes: this run validated the exact remote reward endpoints and WD prompt-hash cache used by the current AWM scaling plan.
+
+### April 26 Synthetic Compatibility Smokes
+
+- `CUDA_VISIBLE_DEVICES=0 python scripts/validate_anima_lora_smoke.py --scenario awm`: pass, `2` samples, `1` optimizer step, `280` changed LoRA parameters.
+- `CUDA_VISIBLE_DEVICES=0 python scripts/validate_anima_lora_smoke.py --scenario nft`: pass, `2` samples, `1` optimizer step, finite policy loss `4.0613`, `280` changed LoRA parameters.
+- `CUDA_VISIBLE_DEVICES=0 python scripts/validate_anima_lora_smoke.py --scenario grpo-sageattn`: pass, `2` samples, `1` optimizer step, ratio stayed at `1.0`, `112` changed LoRA parameters.
+
+### April 26 Attention Benchmark Smoke
+
+- `flash`, batch size `2`, `64x64`, `2` inference steps:
+  - total step time: `1.498s`
+  - train throughput: `1.335 img/s`
+  - sample peak allocation: `4.399 GiB`
+  - optimize peak allocation: `5.505 GiB`
+- `sageattn`, batch size `2`, `64x64`, `2` inference steps:
+  - total step time: `2.675s`
+  - train throughput: `0.748 img/s`
+  - sample peak allocation: `4.399 GiB`
+  - optimize peak allocation: `4.733 GiB`
+- Notes: these are smoke-level benchmark numbers only, not target GPU capacity limits.
+
 ## Outputs
 
 - Save directory: `saves/anima_anime_custom_short_2gpu`
@@ -163,7 +241,7 @@
 
 ## Conclusion
 
-- Did the full training run complete? Smoke and short fallback runs completed. The formal run was not executed in this turn.
-- Did reward variance stay healthy? Yes. Both rewards kept non-zero variance in the completed smoke and short runs.
-- Did image quality improve? Not evaluated in this turn because the completed short fallback run disabled evaluation image export.
-- Recommended next step: run the formal configuration with `aesthetic_shadow` as the only reward, or keep the 2-GPU topology and re-enable evaluation image export for a shadow-only short run before the formal run.
+- Did the full training run complete? No formal long run has been executed. Historical GRPO smoke and short fallback runs completed; the current AWM remote-reward route completed a tiny single-GPU smoke.
+- Did reward variance stay healthy? Yes in the current AWM tiny smoke. Both `aesthetic_shadow` and `wd_reference_similarity` returned non-constant rewards.
+- Did image quality improve? Not evaluated in the April 26 update because the run was a functional smoke with evaluation disabled.
+- Recommended next step: set a finite `train.max_epochs`, then run a short `512x512` AWM job with both remote rewards and evaluation enabled before scaling to the target RTX 5090 run.

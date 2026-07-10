@@ -2,11 +2,12 @@
 
 ## Overview
 
-This document records the implementation and validation status of `model_type: anima` in Flow-Factory as of April 11, 2026.
+This document records the implementation and validation status of `model_type: anima` in Flow-Factory as of April 26, 2026.
 
 The integration targets the local Anima runtime layout used in this workspace:
 
-- DiT checkpoint: `models/animaOfficial_preview2.safetensors`
+- GRPO/NFT DiT checkpoint: `models/animaOfficial_preview2.safetensors`
+- AWM scaling DiT checkpoint: `models/animaOfficial_preview3Base.safetensors`
 - Qwen3 text encoder: `models/qwen_3_06b_base.safetensors`
 - Qwen-Image VAE: `models/qwen_image_vae.safetensors`
 - Tokenizers: `tokenizer/qwen3_06b`, `tokenizer/t5_old`
@@ -87,6 +88,9 @@ Updated example files:
 
 - `examples/grpo/lora/anima.yaml`
 - `examples/grpo/full/anima.yaml`
+- `examples/nft/lora/anima.yaml`
+- `examples/awm/lora/anima.yaml`
+- `examples/grpo/lora/anima_anime_custom.yaml`
 
 Notable changes:
 
@@ -95,6 +99,70 @@ Notable changes:
 - `sd_scripts_root` set to `~/sd-scripts`
 - `train.latent_storage_dtype` set to `bf16`
 - Full finetune example now uses `target_modules: "all"`
+- The AWM custom route uses `dataset/anime_custom_single_gpu_eval16`, Aesthetic Shadow, and WD prompt-hash reference similarity.
+
+## Custom AWM Scaling Route
+
+The current custom anime scaling route is documented in `anima_scaling_plan.md`.
+
+Primary runtime config:
+
+- `examples/awm/lora/anima.yaml`
+
+Dataset split:
+
+- Source: `dataset/anime_custom_single_gpu_eval16/anime4k.jsonl`
+- Source records: `4049`
+- Train split: `dataset/anime_custom_single_gpu_eval16/train.jsonl`, `4033` records
+- Test split: `dataset/anime_custom_single_gpu_eval16/test.jsonl`, `16` records
+- Split rule: random sample 16 test records with seed `42`; use the remaining records for train
+
+Reward stack:
+
+- `aesthetic_shadow`: remote Aesthetic Shadow pointwise reward at `http://127.0.0.1:18081`
+- `wd_reference_similarity`: remote WD EVA02 prompt-hash similarity reward at `http://127.0.0.1:18082`
+- WD reference embedding cache: `dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt`
+- WD cache coverage: `4049` prompt hashes, matching the full source JSONL
+
+Operational notes:
+
+- The WD cache does not need to be rebuilt after the train/test split because it covers all source prompts.
+- `examples/awm/lora/anima.yaml` currently omits `train.max_epochs`; this means training runs until interrupted. Set a finite value before unattended formal runs.
+
+## Reproducible Smoke Runner
+
+The following utility script was added to keep the Anima LoRA smoke checks reproducible:
+
+- `scripts/validate_anima_lora_smoke.py`
+
+It executes a minimized single-rank training flow:
+
+1. `trainer.sample()`
+2. `trainer.prepare_feedback(samples)`
+3. `trainer.optimize(samples)`
+
+The script prints a JSON summary with:
+
+- sample count
+- decoded image shape
+- reward statistics
+- advantage statistics
+- optimizer step count
+- the LoRA parameter with the largest absolute update
+
+## Attention Benchmark Utility
+
+The following utility script was added for single-backend attention smoke benchmarks:
+
+- `scripts/benchmark_anima_attention.py`
+
+It runs one minimized single-rank flow and reports:
+
+- setup time
+- sampling, reward, and optimization time
+- CUDA peak allocation for each phase
+- sample and train throughput
+- LoRA parameter update summary
 
 ## Validation Performed
 
@@ -256,10 +324,207 @@ Observed results:
 
 This confirms that the default reward configuration produces non-constant reward variance, valid normalized advantages, and actual LoRA parameter updates.
 
+### 7. SageAttention GRPO LoRA training-flow smoke
+
+Date: April 26, 2026
+
+Validated with:
+
+- `python scripts/validate_anima_lora_smoke.py --scenario grpo-sageattn`
+- base config: `examples/grpo/lora/anima.yaml`
+- runtime overrides:
+  - `attn_mode=sageattn`
+  - `split_attn=false`
+  - dataset limited to 1 prompt
+  - `group_size=2`
+  - `resolution=64`
+  - `num_inference_steps=2`
+  - one synthetic groupwise reward model (`MyGroupwiseRewardModel`)
+
+Observed results:
+
+- generated sample count: `2`
+- generated image shape: `(3, 64, 64)`
+- reward mean/std: `0.5 / 0.5`
+- advantage range: `[-1, 1]`
+- ratio min/max/mean: `1.0 / 1.0 / 1.0`
+- logged grad norm: `1.5340`
+- optimizer steps completed: `1`
+- changed LoRA parameter count: `112`
+- tracked LoRA parameter:
+  - `base_model.model.blocks.0.mlp.layer1.lora_B.default.weight`
+- tracked parameter norm changed from `0.0` to `0.216796875`
+- tracked parameter absolute delta sum: `157.0`
+
+This confirms that the Anima LoRA training path remains executable when the runtime uses `attn_mode=sageattn`.
+
+### 8. NFT LoRA training-flow smoke
+
+Date: April 26, 2026
+
+Validated with:
+
+- `python scripts/validate_anima_lora_smoke.py --scenario nft`
+- base config: `examples/nft/lora/anima.yaml`
+- runtime overrides:
+  - dataset limited to 1 prompt
+  - `group_size=2`
+  - `resolution=64`
+  - `num_inference_steps=2`
+  - one synthetic groupwise reward model (`MyGroupwiseRewardModel`)
+
+Observed results:
+
+- generated sample count: `2`
+- generated image shape: `(3, 64, 64)`
+- reward mean/std: `0.5 / 0.5`
+- advantage range: `[-1, 1]`
+- optimization logs remained finite:
+  - policy loss: `4.0613`
+  - grad norm: `46.9312`
+- optimizer steps completed: `1`
+- changed LoRA parameter count: `280`
+- tracked LoRA parameter:
+  - `base_model.model.blocks.8.mlp.layer1.lora_B.default.weight`
+- tracked parameter norm changed from `0.0` to `0.072265625`
+- tracked parameter absolute delta sum: `52.25`
+
+This confirms that Anima `forward()` outputs are compatible with the decoupled NFT trainer path without adding trainer-specific model branches.
+
+### 9. AWM LoRA training-flow smoke
+
+Date: April 26, 2026
+
+Validated with:
+
+- `python scripts/validate_anima_lora_smoke.py --scenario awm`
+- base config: `examples/awm/lora/anima.yaml`
+- runtime overrides:
+  - dataset limited to 1 prompt
+  - `group_size=2`
+  - `resolution=64`
+  - `num_inference_steps=2`
+  - one synthetic groupwise reward model (`MyGroupwiseRewardModel`)
+
+Observed results:
+
+- generated sample count: `2`
+- generated image shape: `(3, 64, 64)`
+- reward mean/std: `0.5 / 0.5`
+- advantage range: `[-1, 1]`
+- optimization logs remained finite:
+  - policy loss: `0.0`
+  - KL loss: `0.0`
+  - EMA KL loss: `0.0`
+  - grad norm: `53.4453`
+- optimizer steps completed: `1`
+- changed LoRA parameter count: `280`
+- tracked LoRA parameter:
+  - `base_model.model.blocks.10.mlp.layer1.lora_B.default.weight`
+- tracked parameter norm changed from `0.0` to `0.01025390625`
+- tracked parameter absolute delta sum: `5.25`
+
+This confirms that Anima `forward()` also satisfies the AWM loss path, including the optional KL / EMA-KL branches when their coefficients are kept at the smoke defaults.
+
+### 10. Remote reward service smoke
+
+Date: April 26, 2026
+
+Validated local CPU-mode reward services:
+
+- Aesthetic Shadow:
+  - command: `python scripts/reward_servers/shadow_server.py --host 127.0.0.1 --port 18081 --model-path /root/reward_models/aesthetic-shadow-v2-backup --device cpu --dtype float32`
+  - `/health`: `200 {"status": "ok"}`
+  - `/load`: success
+  - `/compute` on a dummy image: returned one finite reward, `0.15886734426021576`
+  - `/offload`: success
+- WD prompt-hash reference similarity:
+  - command: `python scripts/reward_servers/wd_prompt_hash_server.py --host 127.0.0.1 --port 18082 --model-path /root/reward_models/wd-eva02-large-tagger-v3 --cache-path dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt --device cpu --dtype float32`
+  - `/health`: `200`, `reference_count=4049`
+  - `/load`: success
+  - `/compute` with a prompt from the split dataset and a dummy image: returned one finite reward, `0.042261261492967606`
+  - `/offload`: success
+
+This confirms that the two local reward servers can load, score, and offload using the same endpoints configured in `examples/awm/lora/anima.yaml`.
+
+### 11. AWM real remote-reward training-flow smoke
+
+Date: April 26, 2026
+
+Validated with:
+
+- base config: `examples/awm/lora/anima.yaml`
+- runtime overrides:
+  - dataset limited to 1 prompt from `dataset/anime_custom_single_gpu_eval16`
+  - `group_size=2`
+  - `resolution=64`
+  - `num_inference_steps=2`
+  - `num_train_timesteps=1`
+  - Aesthetic Shadow remote reward
+  - WD prompt-hash reference similarity remote reward
+
+Observed results:
+
+- generated sample count: `2`
+- generated image shape: `(3, 64, 64)`
+- `aesthetic_shadow` reward mean/std: `0.5521295070648193 / 0.12267257273197174`
+- `wd_reference_similarity` reward mean/std: `0.1760590374469757 / 0.020329244434833527`
+- advantage range: `[-1, 1]`
+- ratio min/max/mean: `1.0 / 1.0 / 1.0`
+- logged grad norm: `0.0173`
+- optimizer steps completed: `1`
+
+This validates the `sample -> remote rewards -> advantages -> optimize` path for the current AWM custom route.
+
+### 12. Attention benchmark smoke
+
+Date: April 26, 2026
+
+Validated with:
+
+- `CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_anima_attention.py --backend flash --batch-size 2 --resolution 64 --num-inference-steps 2`
+- `CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_anima_attention.py --backend sageattn --batch-size 2 --resolution 64 --num-inference-steps 2`
+
+Observed results:
+
+- `flash`:
+  - generated sample count: `2`
+  - total step time: `1.498s`
+  - train throughput: `1.335 img/s`
+  - sample peak allocation: `4.399 GiB`
+  - optimize peak allocation: `5.505 GiB`
+  - changed LoRA parameter count: `280`
+  - tracked parameter absolute delta sum: `157.0`
+- `sageattn`:
+  - generated sample count: `2`
+  - total step time: `2.675s`
+  - train throughput: `0.748 img/s`
+  - sample peak allocation: `4.399 GiB`
+  - optimize peak allocation: `4.733 GiB`
+  - changed LoRA parameter count: `112`
+  - tracked parameter absolute delta sum: `157.0`
+
+These are smoke-level benchmark numbers only. They validate script behavior and backend compatibility, not maximum achievable throughput.
+
+### 13. Dataset split validation
+
+Date: April 26, 2026
+
+Validated:
+
+- `dataset/anime_custom_single_gpu_eval16/anime4k.jsonl`: `4049` valid JSONL records
+- `dataset/anime_custom_single_gpu_eval16/train.jsonl`: `4033` valid JSONL records
+- `dataset/anime_custom_single_gpu_eval16/test.jsonl`: `16` valid JSONL records
+- train/test overlap: `0`
+- train/test union matches the source record set
+- `GeneralDataset(..., split="train", enable_preprocess=False)` loads `4033` records
+- `GeneralDataset(..., split="test", enable_preprocess=False)` loads `16` records
+
 ## Notes and Current Limits
 
 - The adapter implementation is shared across GRPO, NFT, and AWM through the common `BaseAdapter` interface.
-- Only the GRPO LoRA training flow was executed end to end in this session.
-- `sageattn` was only validated on the inference path in this workspace.
+- GRPO (`sageattn`), NFT, and AWM LoRA smoke flows were executed end to end on a single rank in this workspace.
+- The current AWM custom route was also validated end to end with real remote Aesthetic Shadow and WD prompt-hash rewards.
+- The WD prompt-hash embedding cache covers the full `anime4k.jsonl` source set and is independent of the train/test split.
 - Advanced `sd-scripts` memory features such as block swapping and custom offload behavior were not ported.
 - The local environment initially missed the `datasets` package, but the dependency is already declared in `pyproject.toml`.

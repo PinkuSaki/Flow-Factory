@@ -1,5 +1,32 @@
 # Anima 模型接入与训练适配计划
 
+## Current Status
+
+Status date: `2026-04-26`.
+
+This file is a historical integration plan. The Anima adapter and the main
+training paths have already been implemented and smoke-tested. Use the following
+documents as the current authoritative references:
+
+- `guidance/anima_support.md`: implementation surface, compatibility matrix, and validation history
+- `guidance/anima_custom_training_report.md`: custom anime training and reward-service report
+- `anima_scaling_plan.md`: current AWM scaling plan with Aesthetic Shadow and WD prompt-hash rewards
+
+Current validated paths:
+
+- `grpo + lora`
+- `grpo + full` instantiation and optimizer grouping
+- `nft + lora`
+- `awm + lora`
+- `grpo + sageattn`
+- AWM with real remote Aesthetic Shadow and WD prompt-hash pointwise rewards
+
+Known remaining work:
+
+- Full checkpoint save/resume parity still needs explicit long-form validation.
+- Multi-GPU AWM scaling with the current two-reward stack has not been executed in the April 26 validation pass.
+- Advanced sd-scripts memory features such as block swapping remain out of scope.
+
 ## 1. 背景
 
 目标是在 Flow-Factory 中新增 `anima` 模型类型，并完成训练链路的全面适配，使其能够在当前框架下支持：
@@ -465,26 +492,27 @@ Anima 不是标准 diffusers 模型，以下能力不能默认认为可复用：
 
 ### 11.1 代码层
 
-- [ ] `model_type: anima` 可正常加载
-- [ ] `AnimaAdapter` 能完成 preprocess / inference / forward
-- [ ] LoRA 保存与恢复可用
-- [ ] full checkpoint 保存与恢复可用
-- [ ] trainer 无需为 Anima 写硬编码特殊分支，或特殊分支最小化
+- [x] `model_type: anima` 可正常加载
+- [x] `AnimaAdapter` 能完成 preprocess / inference / forward
+- [x] LoRA 保存可用
+- [ ] LoRA 恢复可用，需要单独长测
+- [ ] full checkpoint 保存与恢复可用，需要单独长测
+- [x] trainer 无需为 Anima 写硬编码特殊分支，或特殊分支最小化
 
 ### 11.2 运行层
 
-- [ ] `python -m compileall src`
-- [ ] `ff-train examples/grpo/lora/anima.yaml` 最小闭环通过
-- [ ] `ff-train examples/grpo/full/anima.yaml` 最小闭环通过
-- [ ] `ff-train examples/nft/lora/anima.yaml` smoke test 通过
-- [ ] `ff-train examples/awm/lora/anima.yaml` smoke test 通过
+- [x] `python -m compileall src`
+- [x] `examples/grpo/lora/anima.yaml` 最小闭环通过
+- [x] `examples/grpo/full/anima.yaml` adapter instantiation and optimizer grouping smoke 通过
+- [x] `examples/nft/lora/anima.yaml` smoke test 通过
+- [x] `examples/awm/lora/anima.yaml` smoke test 通过
 
 ### 11.3 功能层
 
-- [ ] eval 可正常出图
-- [ ] reward 可消费生成结果
-- [ ] 断点恢复后继续训练不报错
-- [ ] 多卡下 preprocess cache 与训练主循环正常
+- [x] eval 可正常出图
+- [x] reward 可消费生成结果
+- [ ] 断点恢复后继续训练不报错，需要单独长测
+- [ ] 多卡下 preprocess cache 与训练主循环正常，需要当前 AWM 双 reward 路线复测
 
 ## 12. 推荐落地顺序
 
