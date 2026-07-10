@@ -86,6 +86,38 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Distributed eval logging needs separate sample gathering; metric gathering alone does not make media logs global.
 - **Related Constraint**: N/A
 
+### Multi-modal batch homogeneity (R6)
+- **Date**: 2026-04
+- **Symptom**: HF `Dataset.map` produced inconsistent per-sample modality types and batch-length mismatches when a sample had no media item.
+- **Root Cause**: `_preprocess_batch` mixed `None`, tensors, and tensor lists in the same Arrow column.
+- **Fix**: Standardized each modality column as `List[List[Media]]`, using an empty list for missing media, and aligned adapter preprocessing and audio aliases with that representation.
+- **Lesson**: Variable-cardinality Arrow columns need one homogeneous representation for empty, single, and multiple media values.
+- **Related Constraint**: N/A
+
+### Non-abstract encoder defaults (R7)
+- **Date**: 2026-04
+- **Symptom**: Adding audio support initially required no-op encoder stubs in every adapter that did not consume audio.
+- **Root Cause**: Optional modality encoders were incorrectly treated as mandatory abstract methods.
+- **Fix**: Made prompt, image, video, and audio encoders optional no-op defaults while keeping universal adapter operations abstract.
+- **Lesson**: Partial-coverage extension points should use opt-in defaults; reserve abstract methods for contracts every subclass must implement.
+- **Related Constraint**: #12
+
+### [Remote Reward Routing Must Filter Before Serialization]
+- **Date**: 2026-07-11
+- **Symptom**: After merging multi-source reward routing, remote pointwise rewards could serialize and score samples from datasets outside `applicable_datasets`.
+- **Root Cause**: The remote `per_rank` and `main_process` dispatch paths bypassed the source-aware gate used by local pointwise rewards.
+- **Fix**: Updated `src/flow_factory/rewards/reward_processor.py` to mark applicability on local samples, serialize only applicable sub-batches, scatter finite scores back into their original positions, and keep non-applicable positions as `NaN` in both dispatch modes.
+- **Lesson**: Alternative execution backends must share the same routing semantics as the canonical local path; filtering must happen before expensive serialization or model calls.
+- **Related Constraint**: #13
+
+### [Anima CFG Preprocessing Must Follow Guidance Scale]
+- **Date**: 2026-07-11
+- **Symptom**: Anima preprocessing always encoded negative prompts even when CFG was disabled, and a direct `forward()` with incomplete negative conditioning silently skipped requested CFG.
+- **Root Cause**: The adapter retained an older `do_classifier_free_guidance` parameter instead of deriving CFG from the user-facing `guidance_scale` used by the unified adapter contract.
+- **Fix**: Updated `src/flow_factory/models/anima/anima.py` so `encode_prompt()` derives CFG from `guidance_scale > 1.0`, inference passes the scale directly, and `forward()` warns before falling back when negative conditioning is incomplete.
+- **Lesson**: Prompt preprocessing and denoising must derive CFG from the same public field and threshold so cached conditioning matches runtime behavior.
+- **Related Constraint**: #12
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

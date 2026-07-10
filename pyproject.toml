@@ -30,8 +30,8 @@ dependencies = [
     "torchaudio>=2.4.0",
     
     # Hugging Face Ecosystem
-    "transformers>=4.57.1",
-    "diffusers>=0.36.0",
+    "transformers>=4.57.1",  # Compatible with both v4.x and v5.x
+    "diffusers>=0.37.0",  # Qwen-Image transformer derives text seq len from encoder_hidden_states_mask (txt_seq_lens deprecated in 0.37, removed in 0.39)
     "accelerate>=1.11.0",
     "peft>=0.17.0",
     "datasets>=3.3.2",
@@ -65,6 +65,12 @@ quantization = [
     "bitsandbytes>=0.45.3",
 ]
 
+# Bagel adapter runtime (flash-attn varlen kernels + opencv transforms)
+bagel = [
+    "flash-attn>=2.5.8",
+    "opencv-python",
+]
+
 # Experiment tracking
 wandb = [ "wandb" ]
 swanlab = [ "swanlab" ]
@@ -74,9 +80,27 @@ nvidia = [
     "nvidia-ml-py",
 ]
 
+geneval = [
+    "mmcv>=2.0.0,<2.2.0",
+    "mmengine",
+    "mmdet>=3.3.0,<4.0.0",
+    "open_clip_torch",
+]
+
+# GenEval2 Soft-TIFA reward. Qwen3-VL comes with core `transformers`; scipy only adds
+# exact geometric-mean parity with the official GenEval2 script (falls back to a pure-Python
+# gmean when absent).
+geneval2 = [
+    "scipy>=1.11.0",
+]
+
 reward-servers = [
     "timm>=1.0.0",
 ]
+
+# HPS v2 reward is NOT an optional extra: the PyPI `hpsv2` package pins protobuf<4, which
+# conflicts with flow-factory's protobuf>=6. Install it without its dependencies after
+# flow-factory:  uv pip install hpsv2 --no-deps  (runtime works with protobuf 6+).
 
 all = [
     "flow-factory[deepspeed,quantization,reward-servers]",

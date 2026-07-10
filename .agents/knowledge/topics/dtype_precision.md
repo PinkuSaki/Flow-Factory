@@ -8,17 +8,17 @@
 
 | Component | Runtime dtype | Why |
 |-----------|--------------|-----|
-| Transformer (frozen) | `inference_dtype` (bf16/fp16) | Memory savings for frozen params |
-| Transformer (trainable) | `master_weight_dtype` (fp32/bf16) | Gradient precision |
+| Frozen params/buffers (frozen transformer base, VAE, text encoders) | `frozen_parameters_dtype` — default `None` **preserves each component's `from_pretrained` dtype** (no downcast) | Released checkpoints ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16); set an explicit dtype to force one / save memory |
+| Transformer (trainable) | `trainable_parameters_dtype` (fp32/bf16) | Gradient precision |
 | Scheduler math | `float32` always | `1/sigma` amplification (see below) |
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
 | Advantage computation | `float64` (numpy) | Normalization stability |
 
-Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py` L818) and `BaseTrainer.__init__` (autocast context).
+Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context). Autocast weight-cache invariant + in-place ref/EMA/named swaps: `topics/autocast_param_swap.md` (#20a).
 
 ## `cast_latents()` Contract
 
-`BaseAdapter.cast_latents()` (`models/abc.py` L165) casts latents to `latent_storage_dtype` for trajectory storage.
+`BaseAdapter.cast_latents()` (`models/abc.py`) casts latents to `latent_storage_dtype` for trajectory storage.
 
 - **float16 overflow protection**: clamps values exceeding 65504.0 with a warning.
 - **Identity when no target**: returns latents unchanged if `latent_storage_dtype` is unset and no default provided.
@@ -68,5 +68,6 @@ The round-trip ensures that the precision of stored latents matches what trainin
 
 - `constraints.md` #18 (all-rank synchronization — precision errors may manifest differently per rank)
 - `constraints.md` #20 (mixed precision consistency)
+- `topics/autocast_param_swap.md` (#20a)
 - `train_inference_consistency.md` (log_prob mismatch from precision)
 - `topics/timestep_sigma.md` (scheduler math always float32)

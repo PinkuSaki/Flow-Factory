@@ -16,12 +16,15 @@
 
 from .samples import (
     BaseSample,
+    StackedSampleBatch,
     ImageConditionSample,
     VideoConditionSample,
     T2ISample,
     T2VSample,
+    T2AVSample,
     I2ISample,
     I2VSample,
+    I2AVSample,
     V2VSample,
 )
 
@@ -29,11 +32,14 @@ from .samples import (
 __all__ = [
     # Sample classes
     "BaseSample",
+    "StackedSampleBatch",
     "ImageConditionSample",
     "VideoConditionSample",
     "T2ISample",
     "T2VSample",
+    "T2AVSample",
     "I2ISample",
     "I2VSample",
+    "I2AVSample",
     "V2VSample",
 ]

@@ -1,6 +1,6 @@
 ---
 name: ff-new-model
-description: "Complete workflow for adding a new model adapter. Covers analysis, sample dataclass, adapter implementation (7 abstract methods), registry, example YAML, and verification. Trigger: 'add model', 'support new model', 'integrate model', 'new adapter'."
+description: "Complete workflow for adding a new model adapter. Covers analysis, sample dataclass, adapter implementation (4 abstract methods + per-modality encoder overrides), registry, example YAML, and verification. Trigger: 'add model', 'support new model', 'integrate model', 'new adapter'."
 ---
 
 # New Model Adapter Integration
@@ -27,7 +27,8 @@ Before starting, ensure you understand:
 3. **Map pipeline components** to adapter responsibilities:
    - Text encoders → `encode_prompt()`, `preprocessing_modules`
    - VAE → `encode_image()` / `decode_latents()`, `preprocessing_modules`
-   - Transformer/UNet → `forward()`, `target_module_map`, `inference_modules`
+   - Audio encoder/VAE (if any) → `encode_audio()`, `preprocessing_modules`
+   - Transformer/UNet → `forward()`, `default_target_modules` (LoRA target layer names), `inference_modules`
 4. **Also read**: `topics/adapter_conventions.md` for upstream alignment rules; `topics/dtype_precision.md` for precision handling in `cast_latents()`.
 
 ## Phase 2: Implementation
@@ -56,22 +57,27 @@ class MyModelAdapter(BaseAdapter):
         return ["vae"]  # Components needed at inference time
 
     @property
-    def target_module_map(self) -> Dict[str, str]:
-        return {"transformer": "transformer"}  # Trainable components
+    def default_target_modules(self) -> List[str]:
+        # LoRA target module names used when YAML sets `target_modules: default`.
+        # Override only if your transformer uses non-standard attention layer names.
+        return ["to_q", "to_k", "to_v", "to_out.0"]
 ```
+
+> Which components are trainable is **config-driven**: the YAML `target_components` / `target_modules` fields are resolved by `BaseAdapter._parse_target_modules()` into `self.target_module_map` (set in `__init__`). Adapters do **not** override `target_module_map`.
 
 ### Step 3 — Implement Required Methods
 
 | Method | Purpose | Stage | Abstract? |
 |--------|---------|-------|-----------|
 | `load_pipeline()` | Load diffusers pipeline | Init | Yes |
-| `encode_prompt()` | Text → embeddings | 1 | Yes |
-| `encode_image()` | Image → latents | 1 | Yes |
-| `encode_video()` | Video frames → latents | 1 | Yes |
 | `decode_latents()` | Latents → pixels | 3 | Yes |
 | `inference()` | Full multi-step denoising | 3 | Yes |
 | `forward()` | Single-step denoising loss | 6 | Yes |
-| `preprocess_func()` | Raw inputs → cached tensors (calls encode methods) | 1 | No (concrete, override only if needed) |
+| `encode_prompt()` | Text → embeddings | 1 | No (no-op default; override if your model consumes text) |
+| `encode_image()` | Image → latents | 1 | No (no-op default; override if your model consumes images) |
+| `encode_video()` | Video frames → latents | 1 | No (no-op default; override if your model consumes videos) |
+| `encode_audio()` | Audio → embeddings/features | 1 | No (no-op default; override if your model consumes audio) |
+| `preprocess_func()` | Raw inputs → cached tensors (dispatches to the 4 encoders) | 1 | No (concrete, override only for cross-modal preprocessing) |
 
 ### Step 4 — Register
 
@@ -82,11 +88,11 @@ Add to `_MODEL_ADAPTER_REGISTRY` in `src/flow_factory/models/registry.py`:
 
 ## Phase 3: Configuration
 
-Create example YAML config in `examples/grpo/lora/<model>.yaml`:
+Create example YAML config in `examples/grpo/lora/<model>/default.yaml`:
 ```yaml
 model:
   model_type: "my-model"
-  model_path: "org/model-name"
+  model_name_or_path: "org/model-name"
   finetune_type: "lora"
   target_components: ["transformer"]
 ```
@@ -107,8 +113,8 @@ Also read: `topics/parity_testing.md` for the 4-layer verification protocol.
 ## Common Pitfalls
 
 1. **Forgetting to set `preprocessing_modules`** — causes text encoder to stay on GPU, OOM during training
-2. **Wrong `target_module_map`** — LoRA applied to wrong components, no training effect
+2. **Wrong `target_components` / `target_modules` (or `default_target_modules`)** — LoRA applied to wrong components/layers, no training effect
 3. **Mismatched `_shared_fields`** — data corruption during batch collation
 4. **Not handling `enable_preprocess=False`** — encoding components not loaded at inference time
 5. **Inconsistent custom field types across samples** — if a custom sample field is `Tensor` on some samples and `List[Tensor]` on others, `gather_samples` will fall back to slow pickle-based `gather_object`. Always canonicalize to a single type in `__post_init__`; prefer `List[Tensor]` for variable-length data.
-6. **Wrong `images`/`condition_images` convention** — `preprocess_func()`, `encode_image()`, and `inference()` all operate at **batch level**: `images` is `List[List[Image.Image]]` and `condition_images` is `List[List[Tensor(C,H,W)]]`, where the outer list indexes samples in the batch and the inner list holds each sample's condition images. Never pass a flat `List[Image]` or `List[Tensor]`.
+6. **Wrong `images`/`condition_images`/`audios` convention** — `preprocess_func()`, `encode_image()`, `encode_video()`, `encode_audio()`, and `inference()` all operate at **batch level**: `images` is `List[List[Image.Image]]` (`MultiImageBatch`), `condition_images` is `List[List[Tensor(C,H,W)]]` (or `List[List[PIL.Image]]` for adapters that declare `python_format_columns`, e.g. Bagel), and `audios` is `List[List[Tensor]]` (`MultiAudioBatch`), where the outer list indexes samples in the batch and the inner list holds each sample's items. Empty samples contribute `[]` (never `None`); single-item samples contribute `[item]` (never a bare element). Never pass a flat `List[Image]` / `List[Tensor]` or unwrap single-element lists — that breaks Arrow's homogeneous-column requirement and forces every downstream consumer to handle three input shapes. For single-condition models, `_standardize_image_input` / `_standardize_video_input` must detect the nested format with `is_multi_image_batch` / `is_multi_video_batch`, extract the first element per sample (`[batch[0] for batch in images]`), and warn if extra conditions are discarded (e.g. `Wan2_I2V._standardize_image_input`, `LTX2_I2AV._standardize_image_input`). See `topics/adapter_conventions.md` Gotcha #5 and #6.

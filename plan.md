@@ -17,7 +17,7 @@
    - vLLM 端口：`http://127.0.0.1:18082/v1`
    - bridge 端口：`http://127.0.0.1:18083`
 6. 训练配置已落地：
-   - 正式配置：`examples/grpo/lora/anima_anime_custom.yaml`
+   - 正式配置：`examples/grpo/lora/anima/anime_custom.yaml`
    - dual reward smoke：`examples/grpo/lora/anima_anime_custom_dual_smoke.yaml`
    - 2-GPU fallback short：`examples/grpo/lora/anima_anime_custom_short_2gpu.yaml`
 7. dual reward smoke test 已完成，并成功跑完 `sample -> reward -> optimize` 闭环。
@@ -69,7 +69,7 @@
 1. 将 `dataset/anime_custom/anime10k.json` 转成 Flow-Factory 可直接读取的数据集，并拆分训练集与测试集。
 2. 接入训练 reward：
    - 唯一 reward：`/root/reward_models/aesthetic-shadow-v2-backup`
-3. 基于现有 `examples/grpo/lora/anima.yaml` 产出一份专用训练配置并跑通完整训练。
+3. 基于现有 `examples/grpo/lora/anima/default.yaml` 产出一份专用训练配置并跑通完整训练。
 4. 记录实施步骤、配置、日志、样图、reward 变化和最终结论，沉淀为文档。
 
 ## 2. 先纠偏：当前仓库现状
@@ -79,7 +79,7 @@
 1. `anima` 已经在当前仓库中接入完成，不应重复做模型适配。
    - 代码位置：`src/flow_factory/models/anima/anima.py`
    - 注册位置：`src/flow_factory/models/registry.py`
-   - 样例配置：`examples/grpo/lora/anima.yaml`
+   - 样例配置：`examples/grpo/lora/anima/default.yaml`
    - 现状记录：`guidance/anima_support.md`
 2. `dataset/anime_custom/anime10k.json` 当前是一个字典：
    - key 为图片文件名
@@ -106,7 +106,7 @@
      - `flow_factory.rewards.my_reward_remote.RemoteGroupwiseRewardModel`
 4. `shadow` 作为唯一 reward，做 pointwise 打分。
 5. `UnifiedReward-Flex` 不再进入当前训练链路，只保留历史验证记录。
-6. 训练配置从 `examples/grpo/lora/anima.yaml` 复制修改，不从空白 YAML 开始写。
+6. 训练配置从 `examples/grpo/lora/anima/default.yaml` 复制修改，不从空白 YAML 开始写。
 
 ## 4. 资源与拓扑建议
 
@@ -331,11 +331,11 @@ python scripts/reward_servers/unifiedreward_flex_bridge.py \
 
 建议新增：
 
-1. `examples/grpo/lora/anima_anime_custom.yaml`
+1. `examples/grpo/lora/anima/anime_custom.yaml`
 
 直接从以下文件复制：
 
-1. `examples/grpo/lora/anima.yaml`
+1. `examples/grpo/lora/anima/default.yaml`
 
 核心修改项：
 
@@ -362,7 +362,7 @@ python scripts/reward_servers/unifiedreward_flex_bridge.py \
 建议保留的 Anima 配置：
 
 1. `mixed_precision: "bf16"`
-2. `model.master_weight_dtype: "bf16"`
+2. `model.trainable_parameters_dtype: "bf16"`
 3. `train.latent_storage_dtype: "bf16"`
 4. `model.sd_scripts_root: "~/sd-scripts"`
 
@@ -535,7 +535,7 @@ python scripts/reward_servers/unifiedreward_flex_bridge.py \
 
 1. [x] 数据转换脚本已完成，本地可生成 `train.jsonl` / `test.jsonl`，且生成物不入库。
 2. [x] `shadow` reward 服务可正常打分。
-3. [x] `examples/grpo/lora/anima_anime_custom.yaml` 可直接用于 `ff-train`。
+3. [x] `examples/grpo/lora/anima/anime_custom.yaml` 可直接用于 `ff-train`。
 4. [x] smoke test 中出现非零参数更新。
 5. [x] short run 已完成，reward 没有塌成全零；但本轮未输出评估样图。
 6. [ ] formal run 成功保存 checkpoint、日志和评估结果。

@@ -207,15 +207,15 @@ Anima 不能简单复用现有 diffusers pipeline 适配逻辑，原因包括：
 
 建议新增：
 
-- `examples/grpo/lora/anima.yaml`
-- `examples/grpo/full/anima.yaml`
-- `examples/nft/lora/anima.yaml`
-- `examples/awm/lora/anima.yaml`
+- `examples/grpo/lora/anima/default.yaml`
+- `examples/grpo/full/anima/default.yaml`
+- `examples/nft/lora/anima/default.yaml`
+- `examples/awm/lora/anima/default.yaml`
 
 如果首轮只做最小闭环，至少补：
 
-- `examples/grpo/lora/anima.yaml`
-- `examples/grpo/full/anima.yaml`
+- `examples/grpo/lora/anima/default.yaml`
+- `examples/grpo/full/anima/default.yaml`
 
 ## 6. 分阶段实施计划
 
@@ -234,7 +234,7 @@ Anima 不能简单复用现有 diffusers pipeline 适配逻辑，原因包括：
    - `decode_latents()`
    - `inference()`
    - `forward()`
-5. 补最小示例配置 `examples/grpo/lora/anima.yaml`
+5. 补最小示例配置 `examples/grpo/lora/anima/default.yaml`
 
 阶段验收标准：
 
@@ -253,7 +253,7 @@ Anima 不能简单复用现有 diffusers pipeline 适配逻辑，原因包括：
 1. 实现 Anima full checkpoint 保存
 2. 实现 Anima full checkpoint 加载
 3. 对齐 `resume_path` / `resume_type`
-4. 补 `examples/grpo/full/anima.yaml`
+4. 补 `examples/grpo/full/anima/default.yaml`
 
 阶段验收标准：
 
@@ -502,10 +502,10 @@ Anima 不是标准 diffusers 模型，以下能力不能默认认为可复用：
 ### 11.2 运行层
 
 - [x] `python -m compileall src`
-- [x] `examples/grpo/lora/anima.yaml` 最小闭环通过
-- [x] `examples/grpo/full/anima.yaml` adapter instantiation and optimizer grouping smoke 通过
-- [x] `examples/nft/lora/anima.yaml` smoke test 通过
-- [x] `examples/awm/lora/anima.yaml` smoke test 通过
+- [x] `examples/grpo/lora/anima/default.yaml` 最小闭环通过
+- [x] `examples/grpo/full/anima/default.yaml` adapter instantiation and optimizer grouping smoke 通过
+- [x] `examples/nft/lora/anima/default.yaml` smoke test 通过
+- [x] `examples/awm/lora/anima/default.yaml` smoke test 通过
 
 ### 11.3 功能层
 

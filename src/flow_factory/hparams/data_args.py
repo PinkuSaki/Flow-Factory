@@ -14,9 +14,10 @@
 
 # src/flow_factory/hparams/data_args.py
 import yaml
-from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional, Tuple, Union, List, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, List
 from .abc import ArgABC
+from .dataset_args import DatasetArguments
 
 
 @dataclass
@@ -26,6 +27,10 @@ class DataArguments(ArgABC):
         default="data",
         metadata={"help": "Path to the folder containing the datasets."},
     )
+    cache_dir: str = field(
+        default="~/.cache/flow_factory/datasets",
+        metadata={"help": "Directory for caching preprocessed datasets (fingerprinted by content hash)."},
+    )
     image_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing conditioning images. Defaults to 'images' subfolder in dataset_dir."},
@@ -33,6 +38,10 @@ class DataArguments(ArgABC):
     video_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing conditioning videos. Defaults to 'videos' subfolder in dataset_dir."},
+    )
+    audio_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the folder containing audio files. Defaults to 'audios' subfolder in dataset_dir."},
     )
     preprocessing_batch_size: int = field(
         default=8,
@@ -65,7 +74,12 @@ class DataArguments(ArgABC):
             )
         },
     )
-    sampler_type: Literal["auto", "distributed_k_repeat", "group_contiguous"] = field(
+    sampler_type: Literal[
+        "auto",
+        "distributed_k_repeat",
+        "group_contiguous",
+        "group_distributed",
+    ] = field(
         default="auto",
         metadata={
             "help": (
@@ -76,13 +90,92 @@ class DataArguments(ArgABC):
                 "'distributed_k_repeat': shuffle K copies globally across ranks "
                 "(fewer constraints, extra all-gather communication). "
                 "'group_contiguous': keep all K copies of each group on the same rank "
-                "(requires unique_sample_num divisible by world_size)."
+                "(requires unique_sample_num divisible by world_size). "
+                "'group_distributed': split each group evenly across ranks "
+                "(requires group_size divisible by world_size and exact global batch tiling). "
+                "For DGPO trainer, sampler_type is always resolved to 'group_distributed'."
+            )
+        },
+    )
+
+    datasets: Optional[List[DatasetArguments]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Unified list of dataset folders. Each entry opts into "
+                "training (`train:` sub-block) and/or evaluation (`eval:` sub-block); "
+                "shared `image_dir` / `video_dir` / `audio_dir` apply to both splits. "
+                "When set, the legacy `dataset_dir` is ignored for any split that has a "
+                "matching dataset entry. See `DatasetArguments` for the per-entry schema."
             )
         },
     )
 
     def __post_init__(self):
         self.dataset = self.dataset_dir
+
+        # Coerce list-of-dict -> list-of-DatasetArguments
+        # (`ArgABC.from_dict` does NOT recurse into nested list-of-ArgABC fields).
+        # Idempotent: re-running on already-coerced entries is a no-op.
+        if self.datasets is not None:
+            coerced: List[DatasetArguments] = []
+            for item in self.datasets:
+                if isinstance(item, DatasetArguments):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(DatasetArguments.from_dict(item))
+                else:
+                    raise TypeError(
+                        f"data.datasets entry must be dict or DatasetArguments, "
+                        f"got {type(item).__name__}."
+                    )
+            # Treat empty list like None so downstream `if data_args.datasets:` works.
+            self.datasets = coerced or None
+
+    # ------------------------------------------------------------------
+    # Per-split convenience accessors (filter `datasets` by participation).
+    # Trainers and the data-loader read these instead of branching on the
+    # nested `train:` / `eval:` blocks themselves.
+    # ------------------------------------------------------------------
+
+    @property
+    def training_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into training (have `train: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_training_source]
+
+    @property
+    def eval_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into evaluation (have `eval: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_eval_source]
+
+    # ------------------------------------------------------------------
+    # Source-id registry (populated by Arguments._assign_source_ids;
+    # public for trainers, log builders, and reward routing).
+    # ------------------------------------------------------------------
+
+    @property
+    def source_id_to_name(self) -> List[str]:
+        """Stable mapping ``source_id (int) -> source name (str)``.
+
+        Established once in :meth:`Arguments._assign_source_ids` after
+        dataset canonicalization; identical on every rank because YAML
+        parsing is deterministic and every rank receives the same
+        config dict. Returns ``[]`` in legacy single-source mode (no
+        ``data.datasets``) — consumers should treat the empty list as
+        "no source-id space defined" and fall back to legacy behavior.
+        """
+        if self.datasets is None:
+            return []
+        return [d.name for d in self.datasets]
+
+    @property
+    def source_name_to_id(self) -> dict[str, int]:
+        """Inverse mapping, cached after first access."""
+        cached = getattr(self, '_source_name_to_id_cache', None)
+        if cached is None:
+            cached = {n: i for i, n in enumerate(self.source_id_to_name)}
+            object.__setattr__(self, '_source_name_to_id_cache', cached)
+        return cached
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()

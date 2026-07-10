@@ -43,6 +43,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Local-only tests (kept out of the public repo)
+tests/
+
 # ====================
 # Experiment tracking
 # ====================
@@ -99,6 +102,11 @@ latest_checkpointed_iteration.txt
 # Claude Code — keep settings, ignore personal notes
 # ====================
 .claude/CLAUDE.md
+
+# ====================
+# Agent scratch space (temporary analysis, reports, etc.)
+# ====================
+.scratch/
 
 # ====================
 # Dataset assets (keep metadata, ignore media)

@@ -12,7 +12,7 @@
 - Date: `2026-04-26`
 - Scope: update the custom Anima route from the earlier GRPO shadow-only report to the current AWM scaling plan with two remote pointwise rewards.
 - Primary plan: `anima_scaling_plan.md`
-- Primary config: `examples/awm/lora/anima.yaml`
+- Primary config: `examples/awm/lora/anima/default.yaml`
 - Current model checkpoint: `models/animaOfficial_preview3Base.safetensors`
 - Current dataset directory: `dataset/anime_custom_single_gpu_eval16`
 - Current validation host: one visible NVIDIA GeForce RTX 4080 with 32760 MiB VRAM
@@ -105,7 +105,7 @@ Current AWM scaling dataset:
 
 ## Training Configuration
 
-- Baseline formal YAML: `examples/grpo/lora/anima_anime_custom.yaml`
+- Baseline formal YAML: `examples/grpo/lora/anima/anime_custom.yaml`
 - Primary shadow-only smoke YAML: `examples/grpo/lora/anima_anime_custom_shadow_smoke.yaml`
 - Historical dual-reward smoke YAML: `examples/grpo/lora/anima_anime_custom_dual_smoke.yaml`
 - 2-GPU short fallback YAML: `examples/grpo/lora/anima_anime_custom_short_2gpu.yaml`
@@ -120,7 +120,7 @@ Current AWM scaling dataset:
   - `unique_sample_num_per_epoch: 8`
   - `max_epochs: 1`
 - Current active route:
-  - use `examples/awm/lora/anima.yaml`
+  - use `examples/awm/lora/anima/default.yaml`
   - use `aesthetic_shadow`
   - use `wd_reference_similarity`
   - do not start `UnifiedReward-Flex` for the current AWM scaling route
@@ -179,7 +179,7 @@ Current AWM scaling dataset:
 ### April 26 AWM Remote-Reward Smoke
 
 - Date: `2026-04-26`
-- Base config: `examples/awm/lora/anima.yaml`
+- Base config: `examples/awm/lora/anima/default.yaml`
 - Runtime scale overrides: `max_dataset_size=1`, `resolution=64`, `num_inference_steps=2`, `group_size=2`, `unique_sample_num_per_epoch=1`, `num_train_timesteps=1`, `max_epochs=1`, `eval_freq=0`
 - Active rewards:
   - `aesthetic_shadow`

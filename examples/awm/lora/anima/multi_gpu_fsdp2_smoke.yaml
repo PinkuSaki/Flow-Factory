@@ -1,0 +1,103 @@
+# Four-GPU follow-up for the single-GPU Anima AWM smoke test.
+launcher: "accelerate"
+config_file: "config/accelerate_configs/fsdp2.yaml"
+num_processes: 4
+main_process_port: 29516
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: anime_custom
+      dataset_dir: "dataset/anime_custom_single_gpu_eval16"
+      train:
+        weight: 1
+        max_dataset_size: 4
+  preprocessing_batch_size: 1
+  dataloader_num_workers: 1
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  sampler_type: "group_contiguous"
+
+model:
+  finetune_type: "lora"
+  trainable_parameters_dtype: "bf16"
+  lora_rank: 8
+  lora_alpha: 16
+  target_components: "transformer"
+  target_modules: "default"
+  model_name_or_path: "models/anima-base-v1.0.safetensors"
+  model_type: "anima"
+  qwen3: "models/qwen_3_06b_base.safetensors"
+  vae: "models/qwen_image_vae.safetensors"
+  t5_tokenizer_path: "tokenizer/t5_old"
+  sd_scripts_root: "~/sd-scripts"
+  attn_mode: "flash"
+  split_attn: true
+  discrete_flow_shift: 1.0
+
+log:
+  run_name: "anima_awm_multi_gpu_fsdp2_smoke"
+  project: "Flow-Factory"
+  logging_backend: "none"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+train:
+  trainer_type: "awm"
+  max_epochs: 1
+  advantage_aggregation: "sum"
+  off_policy: false
+  awm_weighting: "ghuber"
+  ghuber_power: 0.25
+  num_train_timesteps: 1
+  time_sampling_strategy: "discrete_wo_init"
+  time_shift: 3.0
+  timestep_range: 0.9
+  clip_range: 1.0
+  adv_clip_range: 1.0
+  kl_type: "v-based"
+  kl_beta: 0.0
+  ema_kl_beta: 0.0
+  ema_decay: 0.0
+  latent_storage_dtype: "bf16"
+  resolution: 256
+  num_inference_steps: 2
+  guidance_scale: 4.0
+  per_device_batch_size: 1
+  group_size: 2
+  global_std: true
+  unique_sample_num_per_epoch: 4
+  gradient_step_per_epoch: 1
+  learning_rate: 2.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  enable_gradient_checkpointing: true
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+
+eval:
+  resolution: 256
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 2
+  eval_freq: 0
+  seed: 42
+
+rewards:
+  - name: "aesthetic_shadow"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
+    weight: 1.0
+    batch_size: 8
+    device: "cpu"
+    dtype: float32
+    server_url: "http://127.0.0.1:18081"
+    remote_dispatch_mode: "main_process"
+    remote_max_concurrent_requests: 1
+    remote_offload_after_compute: false
+    timeout: 300.0
+    retry_attempts: 1

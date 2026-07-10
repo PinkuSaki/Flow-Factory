@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-config",
-        default="examples/grpo/lora/anima.yaml",
+        default="examples/grpo/lora/anima/default.yaml",
         help="Base YAML config for the benchmark.",
     )
     parser.add_argument(

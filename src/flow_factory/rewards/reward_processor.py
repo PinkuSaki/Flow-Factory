@@ -16,39 +16,41 @@
 """
 Unified Reward Processor for handling multiple reward models.
 """
+
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
+
 from collections import defaultdict
-from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
+from accelerate import Accelerator
 from tqdm import tqdm
 
-from accelerate import Accelerator
-
+from ..hparams import RewardArguments
+from ..samples import BaseSample
+from ..utils.audio import standardize_audio_batch
+from ..utils.base import filter_kwargs, move_tensors_to_device
+from ..utils.dist import gather_samples
+from ..utils.image import standardize_image_batch
+from ..utils.video import standardize_video_batch
 from .abc import (
     BaseRewardModel,
-    PointwiseRewardModel,
     GroupwiseRewardModel,
+    PointwiseRewardModel,
     RewardModelOutput,
 )
 from .my_reward_remote import serialize_remote_image, serialize_remote_video
-from ..hparams import RewardArguments
-from ..samples import BaseSample
-from ..utils.dist import gather_samples
-from ..utils.base import filter_kwargs
-from ..utils.image import standardize_image_batch
-from ..utils.video import standardize_video_batch
-
 
 _REMOTE_PAYLOAD_FIELDS = (
-    'prompt',
-    'image',
-    'video',
-    'condition_images',
-    'condition_videos',
+    "prompt",
+    "image",
+    "video",
+    "condition_images",
+    "condition_videos",
 )
 
 
@@ -85,24 +87,22 @@ class _RemoteSerializedPayloadCache:
             return self._serialized_fields[field_name]
 
         values = self._get_raw_field(field_name)
-        if field_name == 'prompt':
+        if field_name == "prompt":
             serialized = [str(value) if value is not None else None for value in values]
-        elif field_name == 'image':
+        elif field_name == "image":
             serialized = [
-                serialize_remote_image(value) if value is not None else None
-                for value in values
+                serialize_remote_image(value) if value is not None else None for value in values
             ]
-        elif field_name == 'video':
+        elif field_name == "video":
             serialized = [
-                serialize_remote_video(value) if value is not None else None
-                for value in values
+                serialize_remote_video(value) if value is not None else None for value in values
             ]
-        elif field_name == 'condition_images':
+        elif field_name == "condition_images":
             serialized = [
                 self._serialize_condition_images(value) if value is not None else None
                 for value in values
             ]
-        elif field_name == 'condition_videos':
+        elif field_name == "condition_videos":
             serialized = [
                 self._serialize_condition_videos(value) if value is not None else None
                 for value in values
@@ -115,12 +115,12 @@ class _RemoteSerializedPayloadCache:
 
     @staticmethod
     def _serialize_condition_images(value: Any) -> List[str]:
-        images = standardize_image_batch(value, output_type='pt')
+        images = standardize_image_batch(value, output_type="pt")
         return [serialize_remote_image(image) for image in images]
 
     @staticmethod
     def _serialize_condition_videos(value: Any) -> List[List[str]]:
-        videos = standardize_video_batch(value, output_type='pt')
+        videos = standardize_video_batch(value, output_type="pt")
         return [serialize_remote_video(video) for video in videos]
 
     def build_payload(
@@ -152,10 +152,17 @@ class _RemoteSerializedPayloadCache:
 class RewardProcessor:
     """
     Unified reward processor bound to specific reward models.
-    
+
     Handles both PointwiseRewardModel and GroupwiseRewardModel seamlessly.
     """
-    MEDIA_FIELDS = {'image', 'video', 'condition_images', 'condition_videos'} # Fields that may contain media data, requiring format conversion
+
+    MEDIA_FIELDS = {
+        "image",
+        "video",
+        "audio",
+        "condition_images",
+        "condition_videos",
+    }  # Fields that may contain media data, requiring format conversion
 
     def __init__(
         self,
@@ -172,15 +179,13 @@ class RewardProcessor:
         self.tokenizer = tokenizer
         self.group_on_same_rank = group_on_same_rank
         self.verbose = verbose
-        
+
         # Pre-categorize models by type
-        self._pointwise_models : Dict[str, PointwiseRewardModel] = {
-            k: v for k, v in reward_models.items()
-            if isinstance(v, PointwiseRewardModel)
+        self._pointwise_models: Dict[str, PointwiseRewardModel] = {
+            k: v for k, v in reward_models.items() if isinstance(v, PointwiseRewardModel)
         }
-        self._groupwise_models : Dict[str, GroupwiseRewardModel] = {
-            k: v for k, v in reward_models.items()
-            if isinstance(v, GroupwiseRewardModel)
+        self._groupwise_models: Dict[str, GroupwiseRewardModel] = {
+            k: v for k, v in reward_models.items() if isinstance(v, GroupwiseRewardModel)
         }
 
     @property
@@ -188,15 +193,113 @@ class RewardProcessor:
         """Whether to show tqdm progress bars."""
         return self.verbose and self.accelerator.is_local_main_process
 
+    # ============================ Source-Aware Reward Gating ============================
+    def _reward_applies(self, name: str, sample: BaseSample) -> bool:
+        """Authoritative per-sample applicability for reward ``name``.
+
+        Single source of truth for the gate consumed by both compute
+        (skip the model call when no sample matches) AND aggregation
+        (`AdvantageProcessor` reads `sample.applicable_rewards`, never
+        `np.isnan`, so an in-model NaN bug is NOT silently masked).
+
+        Routing rules:
+
+        - ``RewardArguments.applicable_datasets`` is normally a concrete
+          ``List[str]`` here (resolved by
+          ``Arguments._resolve_reward_dataset_routing``).  As a defensive
+          fallback for callers that construct a ``RewardProcessor`` outside
+          the ``Arguments`` flow, ``None`` is also treated as "applies to
+          every sample".
+        - When the sample has no source (``source is None`` AND
+          ``source_id is None``), absence is treated as "applies" -
+          preserves byte-identical behavior for legacy single-source mode.
+        - Otherwise we prefer the small-int form
+          (``sample.source_id in cfg._datasets_resolved``) when available,
+          falling back to the string form
+          (``sample.source in cfg.applicable_datasets``) when the id
+          resolver hasn't run (direct test instantiation of
+          ``RewardProcessor``).
+        """
+        cfg = self.reward_configs.get(name)
+        if cfg is None or cfg.applicable_datasets is None:
+            return True
+        # Legacy single-source: no source bookkeeping at all -> every reward
+        # applies (this is what the legacy GRPO behavior expected).
+        if sample.source_id is None and sample.source is None:
+            return True
+        # Hot path: int-set membership when both sides have ids.
+        if sample.source_id is not None and cfg._datasets_resolved is not None:
+            return sample.source_id in cfg._datasets_resolved
+        # Fallback: string-list membership.
+        return sample.source in cfg.applicable_datasets
+
+    @staticmethod
+    def _scatter_with_nan_padding(
+        sub_scores: torch.Tensor,
+        mask: List[bool],
+        reward_name: str,
+    ) -> torch.Tensor:
+        """Build a full-length NaN-padded result from a sub-batch model output.
+
+        ``sub_scores`` has shape ``(sum(mask),)`` -- the model output for
+        only the applicable positions.  Returns a tensor of shape
+        ``(len(mask),)`` with NaN at non-applicable positions and
+        ``sub_scores`` scattered into the applicable ones.
+
+        Asserts that the model's output is finite at every applicable
+        position.  A NaN there means the reward model itself returned
+        NaN (overflow / bug) -- surface immediately rather than silently
+        mask, per plan §6.3.
+        """
+        sub_scores = sub_scores.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+        if sub_scores.shape[0] != sum(mask):
+            raise RuntimeError(
+                f"Reward '{reward_name}' returned {sub_scores.shape[0]} scores "
+                f"but {sum(mask)} samples were applicable. Shape mismatch."
+            )
+        if not torch.isfinite(sub_scores).all():
+            bad = (~torch.isfinite(sub_scores)).nonzero(as_tuple=True)[0].tolist()
+            raise RuntimeError(
+                f"Reward '{reward_name}' produced NaN/Inf at applicable "
+                f"sub-batch positions {bad}. This is a model bug, not a "
+                "routing miss — the gate has already filtered non-applicable "
+                "samples out of the input."
+            )
+        full = torch.full((len(mask),), float("nan"), dtype=torch.float32)
+        if any(mask):
+            idx = [i for i, m in enumerate(mask) if m]
+            full[idx] = sub_scores
+        return full
+
+    def _mark_applicable(
+        self,
+        samples: List[BaseSample],
+        mask: List[bool],
+        reward_name: str,
+    ) -> None:
+        """Mark each applicable sample's ``applicable_rewards`` set with ``reward_name``.
+
+        Aggregation in :class:`AdvantageProcessor` reads this set as the
+        authoritative truth (no NaN sniffing), so we MUST update it for
+        every applicable position regardless of whether the model was
+        actually invoked (e.g., even when ``not any(mask)`` we still
+        write NaN; in that case mask is all False and the loop is a no-op).
+        """
+        if not any(mask):
+            return
+        for s, m in zip(samples, mask):
+            if m:
+                s.applicable_rewards.add(reward_name)
+
     def _is_async_reward(self, name: str) -> bool:
         """Check if a named reward model is configured for async computation."""
         config = self.reward_configs.get(name)
-        return getattr(config, 'async_reward', False) if config else False
+        return getattr(config, "async_reward", False) if config else False
 
     def _resolve_num_workers(self, name: str) -> int:
         """Resolve the number of concurrent workers for an async reward model."""
         config = self.reward_configs.get(name)
-        return max(1, getattr(config, 'num_workers', 1)) if config else 1
+        return max(1, getattr(config, "num_workers", 1)) if config else 1
 
     def _resolve_remote_dispatch_mode(
         self,
@@ -208,13 +311,13 @@ class RewardProcessor:
         if config is None:
             return None
 
-        if not getattr(model, 'is_remote_reward', False):
+        if not getattr(model, "is_remote_reward", False):
             return None
 
-        mode = getattr(config, 'remote_dispatch_mode', 'main_process')
-        if mode in {'per_rank', 'local'}:
+        mode = getattr(config, "remote_dispatch_mode", None) or "main_process"
+        if mode in {"per_rank", "local"}:
             return None
-        if mode != 'main_process':
+        if mode != "main_process":
             raise ValueError(
                 f"Invalid remote_dispatch_mode for reward '{name}': {mode!r}. "
                 "Supported values are 'main_process' and 'per_rank'."
@@ -229,7 +332,7 @@ class RewardProcessor:
     ) -> int:
         """Resolve main-process HTTP request concurrency for a remote reward."""
         config = self.reward_configs.get(name)
-        value = getattr(config, 'remote_max_concurrent_requests', 1) if config else 1
+        value = getattr(config, "remote_max_concurrent_requests", 1) if config else 1
         value = int(value)
         if value <= 0:
             raise ValueError(
@@ -245,21 +348,21 @@ class RewardProcessor:
     ) -> bool:
         """Resolve whether to offload a remote server after this reward finishes."""
         config = self.reward_configs.get(name)
-        return bool(getattr(config, 'remote_offload_after_compute', False)) if config else False
+        return bool(getattr(config, "remote_offload_after_compute", False)) if config else False
 
     def _resolve_batch_size(self, name: str, model: BaseRewardModel) -> int:
         """
         Resolve runtime batch size for a pointwise reward model.
-        
+
         Priority:
             1) Explicit config in `self.reward_configs` for this reward name.
             2) Fallback to shared model config (`model.config.batch_size`).
         """
         batch_size = None
         if name in self.reward_configs:
-            batch_size = getattr(self.reward_configs[name], 'batch_size', None)
+            batch_size = getattr(self.reward_configs[name], "batch_size", None)
         if batch_size is None:
-            batch_size = getattr(model.config, 'batch_size', None)
+            batch_size = getattr(model.config, "batch_size", None)
 
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError(
@@ -270,58 +373,78 @@ class RewardProcessor:
         return batch_size
 
     # ============================ Media Format Conversion ============================
-    def _convert_media_format(self, batch_input: Dict[str, Any], model: BaseRewardModel) -> Dict[str, Any]:
+    def _convert_media_format(
+        self, batch_input: Dict[str, Any], model: BaseRewardModel
+    ) -> Dict[str, Any]:
         """Convert tensor media fields to PIL format (unless model opts out)."""
-        if getattr(model, 'use_tensor_inputs', False):
-            output_type = 'pt'
+        if getattr(model, "use_tensor_inputs", False):
+            output_type = "pt"
         else:
-            output_type = 'pil'
-        
+            output_type = "pil"
+
         result = {}
         for k, v in batch_input.items():
             if k not in self.MEDIA_FIELDS or v is None:
                 result[k] = v
                 continue
-            if k == 'image':
+            if k == "image":
                 result[k] = standardize_image_batch(v, output_type=output_type)
-            elif k == 'video':
+            elif k == "video":
                 result[k] = standardize_video_batch(v, output_type=output_type)
-            elif k == 'condition_images':
+            elif k == "audio":
+                # Audio has no PIL representation; map 'pil' -> 'np'
+                audio_output = "pt" if output_type == "pt" else "np"
+                result[k] = standardize_audio_batch(v, output_type=audio_output)
+            elif k == "condition_images":
+                result[k] = [standardize_image_batch(imgs, output_type=output_type) for imgs in v]
+            elif k == "condition_videos":
                 result[k] = [
-                    standardize_image_batch(imgs, output_type=output_type)
-                    for imgs in v
-                ]
-            elif k == 'condition_videos':
-                result[k] = [
-                    standardize_video_batch(videos, output_type=output_type)
-                    for videos in v
+                    standardize_video_batch(videos, output_type=output_type) for videos in v
                 ]
 
         return result
-    
+
     # ============================ Single-batch / Single-group Helpers ============================
+    def _gated_compute(
+        self, name: str, model: BaseRewardModel, samples: List[BaseSample]
+    ) -> torch.Tensor:
+        """Shared gate + compute + NaN-pad for both pointwise and groupwise paths.
+
+        Returns a ``(len(samples),)`` tensor with NaN at non-applicable
+        positions and finite model scores at applicable positions.
+        Updates ``sample.applicable_rewards`` for every applicable sample.
+        """
+        mask = [self._reward_applies(name, s) for s in samples]
+        self._mark_applicable(samples, mask, name)
+
+        if not any(mask):
+            return torch.full((len(samples),), float("nan"), dtype=torch.float32)
+
+        sub_samples = [s for s, m in zip(samples, mask) if m]
+        filtered_fields = filter_kwargs(model.__call__, **sub_samples[0])
+        sub_input: Dict[str, List[Any]] = {
+            k: [getattr(s, k) for s in sub_samples]
+            for k in filtered_fields
+            if all(getattr(s, k) is not None for s in sub_samples)
+        }
+        sub_input = self._convert_media_format(sub_input, model)
+        sub_input = move_tensors_to_device(sub_input, model.device)
+        output = model(**sub_input)
+        sub_scores = torch.as_tensor(
+            output.rewards if hasattr(output, "rewards") else output,
+            dtype=torch.float32,
+        )
+        return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
+
     def _compute_pointwise_batch(
         self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
     ) -> torch.Tensor:
-        """Compute pointwise rewards for a single batch. Returns (batch_size,) tensor."""
-        filtered_fields = filter_kwargs(model.__call__, **batch_samples[0])
-        batch_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in batch_samples]
-            for k in filtered_fields
-            if all(getattr(s, k) is not None for s in batch_samples)
-        }
-        batch_input = self._convert_media_format(batch_input, model)
-        output = model(**batch_input)
-        return torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            device='cpu', dtype=torch.float32,
-        )
+        """Compute pointwise rewards for a single batch with source-aware gating."""
+        return self._gated_compute(name, model, batch_samples)
 
     def _remote_required_fields(self, model: BaseRewardModel) -> Tuple[str, ...]:
         """Return the payload fields used by the remote reward wrapper."""
-        fields = tuple(
-            field for field in model.required_fields if field in _REMOTE_PAYLOAD_FIELDS
-        )
+        fields = tuple(field for field in model.required_fields if field in _REMOTE_PAYLOAD_FIELDS)
         if not fields:
             raise ValueError(
                 f"Remote reward model {type(model).__name__} does not declare any "
@@ -335,7 +458,7 @@ class RewardProcessor:
         payload: Dict[str, Any],
     ) -> torch.Tensor:
         """Compute a remote reward from an already serialized payload."""
-        compute_payload = getattr(model, 'compute_payload', None)
+        compute_payload = getattr(model, "compute_payload", None)
         if compute_payload is None:
             raise TypeError(
                 f"Remote reward model {type(model).__name__} does not support "
@@ -343,25 +466,32 @@ class RewardProcessor:
             )
         output = compute_payload(payload)
         return torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            device='cpu',
+            output.rewards if hasattr(output, "rewards") else output,
+            device="cpu",
             dtype=torch.float32,
         )
 
     def _compute_remote_pointwise_batch(
         self,
+        name: str,
         model: PointwiseRewardModel,
-        payload_cache: _RemoteSerializedPayloadCache,
-        start: int,
-        end: int,
+        batch_samples: List[BaseSample],
     ) -> torch.Tensor:
-        """Compute a remote pointwise batch while reusing serialized media."""
+        """Compute a source-aware remote batch and restore its original positions."""
+        mask = [self._reward_applies(name, sample) for sample in batch_samples]
+        self._mark_applicable(batch_samples, mask, name)
+        if not any(mask):
+            return torch.full((len(batch_samples),), float("nan"), dtype=torch.float32)
+
+        applicable_samples = [sample for sample, applies in zip(batch_samples, mask) if applies]
+        payload_cache = _RemoteSerializedPayloadCache(applicable_samples)
         payload = payload_cache.build_payload(
-            start=start,
-            end=end,
+            start=0,
+            end=len(applicable_samples),
             field_names=self._remote_required_fields(model),
         )
-        return self._compute_remote_payload(model, payload)
+        sub_scores = self._compute_remote_payload(model, payload)
+        return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
 
     def _gather_sample_counts(self, local_count: int) -> list[int]:
         """Gather per-rank sample counts for distributed reward scatter."""
@@ -387,107 +517,19 @@ class RewardProcessor:
     def _signal_remote_lifecycle(
         self,
         model: PointwiseRewardModel,
-        action: Literal['load', 'offload'],
+        action: Literal["load", "offload"],
     ) -> None:
         """Send a remote model lifecycle signal when the model supports it."""
-        method = getattr(model, f'{action}_remote', None)
+        method = getattr(model, f"{action}_remote", None)
         if method is not None:
             method()
 
     def _release_cuda_cache_before_remote_reward(self) -> None:
         """Release idle CUDA cache before a remote reward server loads on GPU."""
-        if self.accelerator.device.type != 'cuda' or not torch.cuda.is_available():
+        if self.accelerator.device.type != "cuda" or not torch.cuda.is_available():
             return
         torch.cuda.synchronize(self.accelerator.device)
         torch.cuda.empty_cache()
-
-    def _compute_main_process_remote_pointwise_reward(
-        self,
-        name: str,
-        model: PointwiseRewardModel,
-        samples: List[BaseSample],
-        epoch: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute a remote pointwise reward from rank 0 with bounded threads."""
-        device = self.accelerator.device
-        rank = self.accelerator.process_index
-
-        self.accelerator.wait_for_everyone()
-        gathered = gather_samples(
-            accelerator=self.accelerator,
-            samples=samples,
-            field_names=list(model.required_fields),
-            device=torch.device('cpu'),
-        )
-        sample_counts = self._gather_sample_counts(len(samples))
-        local_start = sum(sample_counts[:rank])
-        local_end = local_start + sample_counts[rank]
-
-        num_gathered = len(gathered)
-        all_rewards = torch.zeros(num_gathered, dtype=torch.float32, device=device)
-        batch_size = self._resolve_batch_size(name, model)
-        batch_starts = list(range(0, num_gathered, batch_size))
-        max_workers = self._resolve_remote_max_concurrent_requests(name, model)
-        should_offload = self._resolve_remote_offload_after_compute(name, model)
-        error_message = None
-
-        self._release_cuda_cache_before_remote_reward()
-        self.accelerator.wait_for_everyone()
-
-        if self.accelerator.is_main_process:
-            try:
-                if should_offload:
-                    self._signal_remote_lifecycle(model, 'load')
-
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_span = {}
-                    for start in batch_starts:
-                        end = min(start + batch_size, num_gathered)
-                        future = executor.submit(
-                            self._compute_pointwise_batch,
-                            name,
-                            model,
-                            gathered[start:end],
-                        )
-                        future_to_span[future] = (start, end)
-
-                    desc = (
-                        f'Epoch {epoch} Remote Pointwise Rewards: {name}'
-                        if epoch is not None
-                        else f'Remote Pointwise Rewards: {name}'
-                    )
-                    with tqdm(
-                        total=len(future_to_span),
-                        desc=desc,
-                        disable=not self.show_progress_bar,
-                    ) as pbar:
-                        for future in as_completed(future_to_span):
-                            start, end = future_to_span[future]
-                            reward_tensor = future.result().to(device)
-                            all_rewards[start:end] = reward_tensor
-                            pbar.update(1)
-            except Exception as exc:  # noqa: BLE001
-                error_message = f"Remote reward '{name}' failed on main process: {exc}"
-            finally:
-                if should_offload:
-                    try:
-                        self._signal_remote_lifecycle(model, 'offload')
-                    except Exception as exc:  # noqa: BLE001
-                        offload_message = (
-                            f"Remote reward '{name}' offload signal failed: {exc}"
-                        )
-                        error_message = (
-                            offload_message
-                            if error_message is None
-                            else f"{error_message}; {offload_message}"
-                        )
-
-        error_message = self._broadcast_main_process_object(error_message)
-        if error_message is not None:
-            raise RuntimeError(error_message)
-
-        all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
-        return all_rewards[local_start:local_end].cpu()
 
     def _compute_main_process_remote_pointwise_rewards(
         self,
@@ -502,7 +544,11 @@ class RewardProcessor:
         device = self.accelerator.device
         rank = self.accelerator.process_index
 
-        required_fields: Set[str] = set()
+        for name in models:
+            local_mask = [self._reward_applies(name, sample) for sample in samples]
+            self._mark_applicable(samples, local_mask, name)
+
+        required_fields: Set[str] = {"source", "source_id"}
         for model in models.values():
             required_fields.update(self._remote_required_fields(model))
 
@@ -511,7 +557,7 @@ class RewardProcessor:
             accelerator=self.accelerator,
             samples=samples,
             field_names=sorted(required_fields),
-            device=torch.device('cpu'),
+            device=torch.device("cpu"),
         )
         sample_counts = self._gather_sample_counts(len(samples))
         local_start = sum(sample_counts[:rank])
@@ -519,8 +565,7 @@ class RewardProcessor:
 
         num_gathered = len(gathered)
         all_rewards_by_name = {
-            name: torch.zeros(num_gathered, dtype=torch.float32, device=device)
-            for name in models
+            name: torch.zeros(num_gathered, dtype=torch.float32, device=device) for name in models
         }
         error_message = None
 
@@ -528,22 +573,31 @@ class RewardProcessor:
         self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_main_process:
-            payload_cache = _RemoteSerializedPayloadCache(gathered)
             try:
                 for name, model in models.items():
+                    mask = [self._reward_applies(name, sample) for sample in gathered]
+                    if not any(mask):
+                        all_rewards_by_name[name].fill_(float("nan"))
+                        continue
+
+                    applicable_samples = [
+                        sample for sample, applies in zip(gathered, mask) if applies
+                    ]
+                    payload_cache = _RemoteSerializedPayloadCache(applicable_samples)
                     batch_size = self._resolve_batch_size(name, model)
-                    batch_starts = list(range(0, num_gathered, batch_size))
+                    batch_starts = list(range(0, len(applicable_samples), batch_size))
                     max_workers = self._resolve_remote_max_concurrent_requests(name, model)
                     should_offload = self._resolve_remote_offload_after_compute(name, model)
+                    sub_rewards = torch.empty(len(applicable_samples), dtype=torch.float32)
 
                     try:
                         if should_offload:
-                            self._signal_remote_lifecycle(model, 'load')
+                            self._signal_remote_lifecycle(model, "load")
 
                         with ThreadPoolExecutor(max_workers=max_workers) as executor:
                             future_to_span = {}
                             for start in batch_starts:
-                                end = min(start + batch_size, num_gathered)
+                                end = min(start + batch_size, len(applicable_samples))
                                 payload = payload_cache.build_payload(
                                     start=start,
                                     end=end,
@@ -557,9 +611,9 @@ class RewardProcessor:
                                 future_to_span[future] = (start, end)
 
                             desc = (
-                                f'Epoch {epoch} Remote Pointwise Rewards: {name}'
+                                f"Epoch {epoch} Remote Pointwise Rewards: {name}"
                                 if epoch is not None
-                                else f'Remote Pointwise Rewards: {name}'
+                                else f"Remote Pointwise Rewards: {name}"
                             )
                             with tqdm(
                                 total=len(future_to_span),
@@ -568,12 +622,18 @@ class RewardProcessor:
                             ) as pbar:
                                 for future in as_completed(future_to_span):
                                     start, end = future_to_span[future]
-                                    reward_tensor = future.result().to(device)
-                                    all_rewards_by_name[name][start:end] = reward_tensor
+                                    sub_rewards[start:end] = future.result()
                                     pbar.update(1)
                     finally:
                         if should_offload:
-                            self._signal_remote_lifecycle(model, 'offload')
+                            self._signal_remote_lifecycle(model, "offload")
+
+                    full_rewards = self._scatter_with_nan_padding(
+                        sub_rewards,
+                        mask,
+                        reward_name=name,
+                    )
+                    all_rewards_by_name[name].copy_(full_rewards.to(device))
             except Exception as exc:  # noqa: BLE001
                 error_message = f"Remote reward computation failed on main process: {exc}"
 
@@ -582,28 +642,15 @@ class RewardProcessor:
             raise RuntimeError(error_message)
 
         return {
-            name: self.accelerator.reduce(all_rewards, reduction='sum')[
-                local_start:local_end
-            ].cpu()
+            name: self.accelerator.reduce(all_rewards, reduction="sum")[local_start:local_end].cpu()
             for name, all_rewards in all_rewards_by_name.items()
         }
 
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]
     ) -> torch.Tensor:
-        """Compute groupwise rewards for one complete group. Returns (group_size,) tensor."""
-        fields = filter_kwargs(model.__call__, **group_samples[0])
-        group_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in group_samples]
-            for k in fields
-            if all(getattr(s, k) is not None for s in group_samples)
-        }
-        group_input = self._convert_media_format(group_input, model)
-        output = model(**group_input)
-        return torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            device='cpu', dtype=torch.float32,
-        )
+        """Compute groupwise rewards for one complete group with source-aware gating."""
+        return self._gated_compute(name, model, group_samples)
 
     # ============================ Public API ============================
     def compute_rewards(
@@ -611,11 +658,11 @@ class RewardProcessor:
         samples: List[BaseSample],
         store_to_samples: bool = True,
         epoch: Optional[int] = None,
-        split: Literal['pointwise', 'groupwise', 'all'] = 'all',
+        split: Literal["pointwise", "groupwise", "all"] = "all",
     ) -> Dict[str, torch.Tensor]:
         """
         Compute rewards using bound reward models.
-        
+
         Args:
             samples: Local samples on this rank
             store_to_samples: Whether to store rewards in sample.extra_kwargs
@@ -631,21 +678,19 @@ class RewardProcessor:
         results: Dict[str, torch.Tensor] = {}
 
         # Pointwise: local computation
-        if split in ('pointwise', 'all') and self._pointwise_models:
+        if split in ("pointwise", "all") and self._pointwise_models:
             results.update(self._compute_pointwise_rewards(samples, epoch))
-        
+
         # Groupwise: gather -> compute -> scatter
-        if split in ('groupwise', 'all') and self._groupwise_models:
+        if split in ("groupwise", "all") and self._groupwise_models:
             results.update(self._compute_groupwise_rewards(samples, epoch))
 
         self.accelerator.wait_for_everyone()
         # Store to samples
         if store_to_samples:
             for i, sample in enumerate(samples):
-                sample.extra_kwargs['rewards'] = {
-                    k: v[i] for k, v in results.items()
-                }
-        
+                sample.extra_kwargs["rewards"] = {k: v[i] for k, v in results.items()}
+
         return results
 
     # ============================ Pointwise Computation ============================
@@ -661,14 +706,13 @@ class RewardProcessor:
         main_process_remote_models = {
             name: model
             for name, model in models.items()
-            if self._resolve_remote_dispatch_mode(name, model) == 'main_process'
+            if self._resolve_remote_dispatch_mode(name, model) == "main_process"
         }
         main_process_remote_results: Optional[Dict[str, torch.Tensor]] = None
-        local_remote_payload_cache: Optional[_RemoteSerializedPayloadCache] = None
-        
+
         for name, model in models.items():
             dispatch_mode = self._resolve_remote_dispatch_mode(name, model)
-            if dispatch_mode == 'main_process':
+            if dispatch_mode == "main_process":
                 if main_process_remote_results is None:
                     main_process_remote_results = (
                         self._compute_main_process_remote_pointwise_rewards(
@@ -683,7 +727,11 @@ class RewardProcessor:
             rewards = []
             batch_size = self._resolve_batch_size(name, model)
 
-            desc = f'Epoch {epoch} Pointwise Rewards: {name}' if epoch is not None else f'Pointwise Rewards: {name}'
+            desc = (
+                f"Epoch {epoch} Pointwise Rewards: {name}"
+                if epoch is not None
+                else f"Pointwise Rewards: {name}"
+            )
             pbar = tqdm(
                 range(0, len(samples), batch_size),
                 desc=desc,
@@ -691,21 +739,18 @@ class RewardProcessor:
             )
             for i in pbar:
                 batch_samples = samples[i : i + batch_size]
-                if getattr(model, 'is_remote_reward', False):
-                    if local_remote_payload_cache is None:
-                        local_remote_payload_cache = _RemoteSerializedPayloadCache(samples)
+                if getattr(model, "is_remote_reward", False):
                     reward_tensor = self._compute_remote_pointwise_batch(
+                        name=name,
                         model=model,
-                        payload_cache=local_remote_payload_cache,
-                        start=i,
-                        end=i + len(batch_samples),
+                        batch_samples=batch_samples,
                     )
                 else:
                     reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
                 rewards.append(reward_tensor)
-            
+
             results[name] = torch.cat(rewards, dim=0)
-        
+
         return results
 
     # ============================ Groupwise Computation ============================
@@ -740,8 +785,12 @@ class RewardProcessor:
         Used when ``group_on_same_rank=True`` (i.e. ``group_contiguous`` sampler):
         all K copies of each prompt reside on the same rank, so we group and
         compute entirely locally.
+
+        Each per-group call routes through :meth:`_compute_groupwise_group`,
+        which applies the source-aware gate + NaN-pad uniformly with the
+        sync pointwise / async paths.
         """
-        groups, inverse = self.group_samples(samples, key='unique_id', return_inverse=True)
+        groups, inverse = self.group_samples(samples, key="unique_id", return_inverse=True)
         group_keys = list(groups.keys())
 
         # Sanity check: all groups must have the same size (= K)
@@ -755,8 +804,12 @@ class RewardProcessor:
 
         results: Dict[str, torch.Tensor] = {}
         for name, model in models.items():
-            all_rewards = torch.zeros(len(samples), dtype=torch.float32)
-            desc = f'Epoch {epoch} Groupwise Rewards: {name}' if epoch is not None else f'Groupwise Rewards: {name}'
+            all_rewards = torch.full((len(samples),), float("nan"), dtype=torch.float32)
+            desc = (
+                f"Epoch {epoch} Groupwise Rewards: {name}"
+                if epoch is not None
+                else f"Groupwise Rewards: {name}"
+            )
             pbar = tqdm(
                 range(len(group_keys)),
                 desc=desc,
@@ -765,20 +818,9 @@ class RewardProcessor:
             for group_idx in pbar:
                 uid = group_keys[group_idx]
                 group_list = groups[uid]
-
-                fields = filter_kwargs(model.__call__, **group_list[0])
-                group_input = {
-                    k: [getattr(s, k) for s in group_list]
-                    for k in fields
-                    if all(getattr(s, k) is not None for s in group_list)
-                }
-                group_input = self._convert_media_format(group_input, model)
-
-                output = model(**group_input)
-                group_rewards = torch.as_tensor(
-                    output.rewards if hasattr(output, 'rewards') else output,
-                    dtype=torch.float32,
-                ).cpu()
+                # Gated + NaN-padded compute. all_rewards is already NaN-init,
+                # so non-applicable groups land as NaN automatically.
+                group_rewards = self._compute_groupwise_group(name, model, group_list)
                 all_rewards[inverse == group_idx] = group_rewards
 
             results[name] = all_rewards
@@ -796,6 +838,15 @@ class RewardProcessor:
         Used when ``group_on_same_rank=False`` (i.e. ``distributed_k_repeat`` sampler):
         K copies are scattered across ranks, so we gather all samples, partition
         groups by stride, compute, all_reduce, and scatter back.
+
+        Source-aware gating: each group is owned by exactly one rank
+        under the stride partition.  That rank computes its rewards via
+        :meth:`_compute_groupwise_group`, which writes NaN at
+        non-applicable positions (and finite scores otherwise).  Other
+        ranks contribute zeros for groups they don't own; the
+        ``reduce(sum)`` therefore produces NaN at non-applicable group
+        positions and finite scores at applicable ones — gather/reduce
+        participants stay shape-uniform across ranks (no deadlock).
         """
         device = self.accelerator.device
         rank = self.accelerator.process_index
@@ -806,12 +857,22 @@ class RewardProcessor:
         for model in models.values():
             required_fields.update(model.required_fields)
 
+        # Always include the typed source bookkeeping — the gate needs
+        # `source` (and ideally `source_id`) on the gathered side.  Now
+        # that they're real dataclass fields on `BaseSample`, gathering
+        # them directly is cheaper than dragging the whole `extra_kwargs`
+        # dict across ranks (the latter forces every extra key to be
+        # packed/unpacked, which is wasteful when we only need one or
+        # two of them).
+        required_fields.add("source")
+        required_fields.add("source_id")
+
         # Optimize: use prompt_ids instead of prompt strings for communication
         needs_decode = False
-        if 'prompt' in required_fields:
-            if hasattr(samples[0], 'prompt_ids') and samples[0].prompt_ids is not None:
-                required_fields.discard('prompt')
-                required_fields.add('prompt_ids')
+        if "prompt" in required_fields:
+            if hasattr(samples[0], "prompt_ids") and samples[0].prompt_ids is not None:
+                required_fields.discard("prompt")
+                required_fields.add("prompt_ids")
                 needs_decode = True
 
         # 2. Sync and gather samples from all ranks
@@ -830,20 +891,44 @@ class RewardProcessor:
                 s.prompt = prompts[i]
 
         # 3. Group by unique_id and build inverse mapping
-        groups, inverse = self.group_samples(gathered, key='unique_id', return_inverse=True)
+        groups, inverse = self.group_samples(gathered, key="unique_id", return_inverse=True)
         group_keys = list(groups.keys())
         num_gathered = len(gathered)
 
         # 4. Stride distribution: rank i handles groups [i, i+W, i+2W, ...]
         local_group_indices = list(range(rank, len(group_keys), world_size))
 
-        # 5. Compute rewards per model
-        results: Dict[str, torch.Tensor] = {}
+        # 4b. Pre-compute per-group applicability (deterministic across all
+        # ranks because they all see the same `gathered` and the same
+        # reward configs).  Used to:
+        #   - mark applicable_rewards on every rank's gathered view (so
+        #     the bookkeeping is consistent before the post-reduce scatter);
+        #   - post-process the reduced tensor to write NaN at
+        #     non-applicable group positions (the owning rank produced 0
+        #     there during compute; NaN-replacement happens once after
+        #     the all-reduce).
+        per_group_applicable: Dict[str, np.ndarray] = {}
+        for name in models.keys():
+            applicable = np.zeros(len(group_keys), dtype=bool)
+            for g_idx, uid in enumerate(group_keys):
+                # All K samples in a group share __source__ (asserted in
+                # _compute_groupwise_group), so checking sample[0] suffices.
+                applicable[g_idx] = self._reward_applies(name, groups[uid][0])
+            per_group_applicable[name] = applicable
+
+        # 5. Compute rewards per model (accumulate for batched reduce).
+        model_names = list(models.keys())
+        reward_columns: List[torch.Tensor] = []
 
         for name, model in models.items():
-            # Initialize with zeros - only fill positions this rank computes
             all_rewards = torch.zeros(num_gathered, dtype=torch.float32, device=device)
-            desc = f'Epoch {epoch} Groupwise Rewards: {name}' if epoch is not None else f'Groupwise Rewards: {name}'
+            applicable_groups = per_group_applicable[name]
+
+            desc = (
+                f"Epoch {epoch} Groupwise Rewards: {name}"
+                if epoch is not None
+                else f"Groupwise Rewards: {name}"
+            )
             pbar = tqdm(
                 local_group_indices,
                 desc=desc,
@@ -853,7 +938,9 @@ class RewardProcessor:
                 uid = group_keys[group_idx]
                 group_list = groups[uid]
 
-                # Prepare group input
+                if not applicable_groups[group_idx]:
+                    continue
+
                 fields = filter_kwargs(model.__call__, **group_list[0])
                 group_input = {
                     k: [getattr(s, k) for s in group_list]
@@ -862,26 +949,42 @@ class RewardProcessor:
                 }
                 group_input = self._convert_media_format(group_input, model)
 
-                # Compute rewards
                 output = model(**group_input)
                 group_rewards = torch.as_tensor(
-                    output.rewards if hasattr(output, 'rewards') else output,
-                    device=device, dtype=torch.float32,
+                    output.rewards if hasattr(output, "rewards") else output,
+                    device=device,
+                    dtype=torch.float32,
                 )
 
-                # Fill positions belonging to this group
-                mask = (inverse == group_idx)
-                all_rewards[mask] = group_rewards
+                if not torch.isfinite(group_rewards).all():
+                    bad = (~torch.isfinite(group_rewards)).nonzero(as_tuple=True)[0].tolist()
+                    raise RuntimeError(
+                        f"Groupwise reward '{name}' produced NaN/Inf at applicable "
+                        f"positions {bad} of group uid={uid}. This is a model bug, "
+                        "not a routing miss."
+                    )
 
-            # 6. All-reduce SUM: each position has value from exactly one rank
-            all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
-            results[name] = all_rewards.cpu()
+                mask_t = inverse == group_idx
+                all_rewards[mask_t] = group_rewards
+
+            reward_columns.append(all_rewards)
+
+        # 6. Batched all-reduce: pack M reward vectors into (W*B, M),
+        # reduce once, then unpack. M sequential NCCL calls -> 1.
+        packed_rewards = torch.stack(reward_columns, dim=1)  # (W*B, M)
+        packed_rewards = self.accelerator.reduce(packed_rewards, reduction="sum")
+
+        # 6b. NaN-fill non-applicable group positions + unpack.
+        results: Dict[str, torch.Tensor] = {}
+        for m_idx, name in enumerate(model_names):
+            cpu = packed_rewards[:, m_idx].cpu()
+            applicable_groups = per_group_applicable[name]
+            nan_mask = ~applicable_groups[inverse]
+            cpu[nan_mask] = float("nan")
+            results[name] = cpu
 
         # 7. Scatter back to local rank
-        results = {
-            k: v.chunk(world_size)[rank]
-            for k, v in results.items()
-        }
+        results = {k: v.chunk(world_size)[rank] for k, v in results.items()}
 
         return results
 
@@ -890,48 +993,34 @@ class RewardProcessor:
         """Decode prompt_ids to strings."""
         if self.tokenizer is None:
             raise ValueError("Cannot decode prompts: tokenizer not provided")
-        
+
         return [
             self.tokenizer.decode(
                 ids.cpu().tolist() if isinstance(ids, torch.Tensor) else ids,
-                skip_special_tokens=True
+                skip_special_tokens=True,
             )
             for ids in prompt_ids_list
         ]
 
-    def _encode_prompts(self, prompts: List[str]) -> List[torch.Tensor]:
-        """Encode strings to prompt_ids."""
-        if self.tokenizer is None:
-            raise ValueError("Cannot encode prompts: tokenizer not provided")
-        
-        return [
-            self.tokenizer(text, return_tensors='pt', padding=False, truncation=True)
-            .input_ids.squeeze(0)
-            for text in prompts
-        ]
-    
     # ============================ Helper Functions ============================
     @staticmethod
     def compute_group_zero_std_ratio(
-        rewards: np.ndarray, 
-        group_indices: np.ndarray, 
-        eps: float = 1e-6
+        rewards: np.ndarray, group_indices: np.ndarray, eps: float = 1e-6
     ) -> float:
         """
         Compute the fraction of groups with near-zero standard deviation.
-        
+
         Args:
             rewards: Array of reward values
             group_indices: Array mapping each sample to its group
             eps: Threshold for considering std as zero
-            
+
         Returns:
             Fraction of groups with std < eps
         """
         unique_groups = np.unique(group_indices)
         zero_std_count = sum(
-            1 for gid in unique_groups 
-            if np.std(rewards[group_indices == gid]) < eps
+            1 for gid in unique_groups if np.std(rewards[group_indices == gid]) < eps
         )
         return zero_std_count / len(unique_groups)
 
@@ -952,25 +1041,25 @@ class RewardProcessor:
             group_stds:  Per-group std of rewards, shape (num_groups,)
         """
         unique_groups = np.unique(group_indices)
-        group_stds  = np.array([np.std(rewards[group_indices == gid])  for gid in unique_groups])
+        group_stds = np.array([np.std(rewards[group_indices == gid]) for gid in unique_groups])
         group_means = np.array([np.mean(rewards[group_indices == gid]) for gid in unique_groups])
         return group_means, group_stds
 
     @staticmethod
     def group_samples(
         samples: List[BaseSample],
-        key: str = 'unique_id',
+        key: str = "unique_id",
         return_inverse: bool = False,
     ) -> Union[Dict[Any, List[BaseSample]], Tuple[Dict[Any, List[BaseSample]], np.ndarray]]:
         """
         Group samples by a key field, similar to np.unique.
-        
+
         Args:
             samples: List of BaseSample instances
             key: Field name to group by (default: 'unique_id')
             return_inverse: If True, return indices to reconstruct original order
             return_index: If True, return first occurrence index for each group
-        
+
         Returns:
             groups: Dict mapping key_value -> List[BaseSample]
             inverse: (optional) Array where inverse[i] gives group index for samples[i]
@@ -978,11 +1067,11 @@ class RewardProcessor:
         """
         keys = np.array([getattr(s, key) for s in samples])
         unique_keys, inverse = np.unique(keys, return_inverse=True)
-        
+
         groups: Dict[Any, List[BaseSample]] = {k: [] for k in unique_keys}
         for sample, k in zip(samples, keys):
             groups[k].append(sample)
-        
+
         return (groups, inverse) if return_inverse else groups
 
 
@@ -1014,14 +1103,22 @@ class RewardBuffer:
 
         # Partition all reward models into async / sync groups based on
         # each model's RewardArguments.async_reward setting.
-        self._async_pointwise = {n: m for n, m in self.rp._pointwise_models.items() if self.rp._is_async_reward(n)}
-        self._sync_pointwise  = {n: m for n, m in self.rp._pointwise_models.items() if not self.rp._is_async_reward(n)}
-        self._async_groupwise = {n: m for n, m in self.rp._groupwise_models.items() if self.rp._is_async_reward(n)}
-        self._sync_groupwise  = {n: m for n, m in self.rp._groupwise_models.items() if not self.rp._is_async_reward(n)}
+        self._async_pointwise = {
+            n: m for n, m in self.rp._pointwise_models.items() if self.rp._is_async_reward(n)
+        }
+        self._sync_pointwise = {
+            n: m for n, m in self.rp._pointwise_models.items() if not self.rp._is_async_reward(n)
+        }
+        self._async_groupwise = {
+            n: m for n, m in self.rp._groupwise_models.items() if self.rp._is_async_reward(n)
+        }
+        self._sync_groupwise = {
+            n: m for n, m in self.rp._groupwise_models.items() if not self.rp._is_async_reward(n)
+        }
         self._has_async = bool(self._async_pointwise or self._async_groupwise)
 
         for name, model in self._async_pointwise.items():
-            if self.rp._resolve_remote_dispatch_mode(name, model) == 'main_process':
+            if self.rp._resolve_remote_dispatch_mode(name, model) == "main_process":
                 raise ValueError(
                     f"Reward '{name}' cannot use both async_reward=True and "
                     "remote_dispatch_mode='main_process'. Disable async_reward for "
@@ -1033,7 +1130,7 @@ class RewardBuffer:
         self._reward_streams: Dict[torch.device, torch.cuda.Stream] = {}
         if self._has_async:
             for m in list(self._async_pointwise.values()) + list(self._async_groupwise.values()):
-                if m.device.type == 'cuda' and m.device not in self._reward_streams:
+                if m.device.type == "cuda" and m.device not in self._reward_streams:
                     self._reward_streams[m.device] = torch.cuda.Stream(device=m.device)
 
         self._init_async_state()
@@ -1057,10 +1154,7 @@ class RewardBuffer:
         self._pointwise_pending: Dict[str, List[int]] = {n: [] for n in self._async_pointwise}
         self._groupwise_pending: Dict[int, List[int]] = defaultdict(list)
         self._any_cuda_reward = bool(self._reward_streams)
-        total_workers = sum(
-            self.rp._resolve_num_workers(n)
-            for n in async_names
-        )
+        total_workers = sum(self.rp._resolve_num_workers(n) for n in async_names)
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max(1, total_workers))
         self._futures: List[Tuple[str, List[int], Future]] = []
 
@@ -1076,6 +1170,16 @@ class RewardBuffer:
         if self._has_async:
             self._executor.shutdown(wait=True)
             self._init_async_state()
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True) -> None:
+        """Terminate the async executor without reinitializing.
+
+        Unlike ``clear()`` (which waits for tasks and resets for reuse), this
+        method is intended for final teardown — e.g. on KeyboardInterrupt —
+        where speed matters more than task completion.
+        """
+        if self._has_async and hasattr(self, "_executor"):
+            self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
 
     def add_samples(self, samples: List[BaseSample]) -> None:
         """Accumulate new samples and submit ready async reward tasks.
@@ -1115,7 +1219,7 @@ class RewardBuffer:
     def finalize(
         self,
         store_to_samples: bool = True,
-        split: Literal['pointwise', 'groupwise', 'all'] = 'all',
+        split: Literal["pointwise", "groupwise", "all"] = "all",
     ) -> Dict[str, torch.Tensor]:
         """Complete all reward computation and return the merged result dict.
 
@@ -1130,10 +1234,14 @@ class RewardBuffer:
         results: Dict[str, torch.Tensor] = {}
 
         # 1. Compute sync rewards (blocking, on main thread)
-        if split in ('pointwise', 'all') and self._sync_pointwise:
-            results.update(self.rp._compute_pointwise_rewards(self.all_samples, models=self._sync_pointwise))
-        if split in ('groupwise', 'all') and self._sync_groupwise:
-            results.update(self.rp._compute_groupwise_rewards(self.all_samples, models=self._sync_groupwise))
+        if split in ("pointwise", "all") and self._sync_pointwise:
+            results.update(
+                self.rp._compute_pointwise_rewards(self.all_samples, models=self._sync_pointwise)
+            )
+        if split in ("groupwise", "all") and self._sync_groupwise:
+            results.update(
+                self.rp._compute_groupwise_rewards(self.all_samples, models=self._sync_groupwise)
+            )
 
         # 2. Flush and collect async rewards
         if self._has_async:
@@ -1145,7 +1253,7 @@ class RewardBuffer:
         # 3. Store to samples
         if store_to_samples:
             for i, sample in enumerate(self.all_samples):
-                sample.extra_kwargs['rewards'] = {k: v[i] for k, v in results.items()}
+                sample.extra_kwargs["rewards"] = {k: v[i] for k, v in results.items()}
 
         return results
 
@@ -1163,7 +1271,7 @@ class RewardBuffer:
         with ctx:
             if sync_event is not None and stream is not None:
                 stream.wait_event(sync_event)
-            if task_type == 'pointwise':
+            if task_type == "pointwise":
                 return self.rp._compute_pointwise_batch(name, model, samples)
             else:
                 return self.rp._compute_groupwise_group(name, model, samples)
@@ -1191,7 +1299,12 @@ class RewardBuffer:
                 pending = self._pointwise_pending[name]
                 batch_samples = [self.all_samples[i] for i in batch_idx]
                 future = self._executor.submit(
-                    self._execute_task, 'pointwise', name, model, batch_samples, sync_event,
+                    self._execute_task,
+                    "pointwise",
+                    name,
+                    model,
+                    batch_samples,
+                    sync_event,
                 )
                 self._futures.append((name, batch_idx, future))
         # Groupwise: dispatch complete groups
@@ -1200,7 +1313,12 @@ class RewardBuffer:
                 group_samples = [self.all_samples[i] for i in indices]
                 for name, model in self._async_groupwise.items():
                     future = self._executor.submit(
-                        self._execute_task, 'groupwise', name, model, group_samples, sync_event,
+                        self._execute_task,
+                        "groupwise",
+                        name,
+                        model,
+                        group_samples,
+                        sync_event,
                     )
                     self._futures.append((name, list(indices), future))
                 del self._groupwise_pending[uid]
@@ -1229,7 +1347,12 @@ class RewardBuffer:
             if pending:
                 batch_samples = [self.all_samples[i] for i in pending]
                 future = self._executor.submit(
-                    self._execute_task, 'pointwise', name, model, batch_samples, sync_event,
+                    self._execute_task,
+                    "pointwise",
+                    name,
+                    model,
+                    batch_samples,
+                    sync_event,
                 )
                 self._futures.append((name, list(pending), future))
                 self._pointwise_pending[name] = []
@@ -1239,7 +1362,7 @@ class RewardBuffer:
         completed = 0
         with tqdm(
             total=total,
-            desc='Async Rewards',
+            desc="Async Rewards",
             disable=not self.rp.show_progress_bar,
         ) as pbar:
             for name, indices, future in self._futures:
@@ -1250,17 +1373,17 @@ class RewardBuffer:
                 pbar.n = completed
                 pbar.refresh()
         # 3. Verify all groupwise groups completed
-        assert len(self._groupwise_pending) == 0, (
-            f"Incomplete groups remaining: {list(self._groupwise_pending.keys())}"
-        )
+        assert (
+            len(self._groupwise_pending) == 0
+        ), f"Incomplete groups remaining: {list(self._groupwise_pending.keys())}"
         # 4. Synchronize CUDA streams
         for stream in self._reward_streams.values():
             stream.synchronize()
         # 5. Assemble results
         results: Dict[str, torch.Tensor] = {}
         for name, reward_list in self._rewards.items():
-            assert all(r is not None for r in reward_list), (
-                f"Missing rewards for async model '{name}'"
-            )
+            assert all(
+                r is not None for r in reward_list
+            ), f"Missing rewards for async model '{name}'"
             results[name] = torch.stack(reward_list)
         return results

@@ -12,63 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
+import hashlib
+import json
+import logging
+
 # src/flow_factory/models/abc.py
 import os
 import re
-import json
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable, Set
-from dataclasses import dataclass, field, asdict, fields
-from contextlib import contextmanager, nullcontext, ExitStack
-import logging
-import hashlib
-import glob
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union, cast
 
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-
-from PIL import Image
 import numpy as np
-from safetensors.torch import save_file, load_file
-from diffusers.utils.outputs import BaseOutput
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from peft import get_peft_model, LoraConfig, PeftModel
-
-from huggingface_hub import split_torch_state_dict_into_shards
+import torch
+import torch.distributed as dist
+import torch.nn as nn
 from accelerate import Accelerator, DistributedType
 from accelerate.state import PartialState
-from accelerate.utils.modeling import (
-    get_state_dict_offloaded_model,
-)
 from accelerate.utils import (
-    WEIGHTS_NAME,
-    WEIGHTS_PATTERN_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
     SAFE_WEIGHTS_PATTERN_NAME,
     WEIGHTS_INDEX_NAME,
-    SAFE_WEIGHTS_INDEX_NAME,
-    has_offloaded_params,
+    WEIGHTS_NAME,
+    WEIGHTS_PATTERN_NAME,
     clean_state_dict_for_safetensors,
+    has_offloaded_params,
 )
+from accelerate.utils.modeling import (
+    get_state_dict_offloaded_model,
+)
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.utils.outputs import BaseOutput
+from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+from peft import LoraConfig, PeftModel, get_peft_model
+from PIL import Image
+from safetensors.torch import load_file, save_file
 
+from ..ema import EMAModuleWrapper
+from ..hparams import *
+from ..samples import BaseSample
+from ..scheduler import (
+    SDESchedulerMixin,
+    SDESchedulerOutput,
+)
+from ..scheduler import load_scheduler as _load_scheduler
+from ..utils.audio import MultiAudioBatch
+from ..utils.base import filter_kwargs, is_tensor_list
 from ..utils.checkpoint import (
-    mapping_lora_state_dict,
+    HF_PATH_PREFIX,
+    download_hf_checkpoint,
     infer_lora_config,
     infer_target_modules,
+    mapping_lora_state_dict,
+    parse_hf_checkpoint_path,
 )
-from ..samples import BaseSample
-from ..ema import EMAModuleWrapper
-from ..scheduler import (
-    load_scheduler as _load_scheduler,
-    SDESchedulerOutput,
-    SDESchedulerMixin,
-)
-from ..hparams import *
-from ..utils.base import filter_kwargs, is_tensor_list
+from ..utils.image import MultiImageBatch
 from ..utils.logger_utils import setup_logger
+from ..utils.video import MultiVideoBatch
+from .latent_geometry import LatentAxes, infer_latent_axes
+from .model_bundle import RoutedComponentProxy
 
 # Constants
 CONFIG_NAME = "config.json"
@@ -83,62 +91,107 @@ LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 
 logger = setup_logger(__name__)
 
+
 @dataclass
 class NamedParametersInfo:
     """Metadata for named parameters snapshot."""
+
     target_components: List[str]
     ema_wrapper: EMAModuleWrapper
+
 
 class BaseAdapter(ABC):
     """
     Abstract Base Class for Flow-Factory models.
     """
 
-    _DTYPE_MAP = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32}
+    _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
     lora_keys: List[str] = [
-            "lora_A", "lora_B",
-            "lora_magnitude_vector",  # DoRA
-            "lora_embedding_A", "lora_embedding_B",  # Embedding LoRA
-            "modules_to_save",  # Additional modules marked for saving
-        ]
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+        "lora_A",
+        "lora_B",
+        "lora_magnitude_vector",  # DoRA
+        "lora_embedding_A",
+        "lora_embedding_B",  # Embedding LoRA
+        "modules_to_save",  # Additional modules marked for saving
+    ]
+
+    # Names of ``preprocess_func`` output columns that must be surfaced in the HF
+    # "python" format (returned as PIL, never tensorized) instead of the torch
+    # format. They are persisted via the HuggingFace ``Image`` feature (PNG bytes)
+    # rather than raw tensors, which lets the dataset store variable-size /
+    # variable-count images (e.g. multi-reference I2I) that Arrow cannot serialize
+    # as ragged tensors, and read them back as PIL -- see
+    # ``data_utils.dataset._apply_torch_format``.
+    #
+    # MUST contain only genuine RGB image columns: each entry is run through PIL
+    # canonicalization (``_to_pil_image_list``), so non-image data would break.
+    # Empty by default and OPT-IN per adapter: only declare an output here when it
+    # is a genuine RGB image that survives a PIL round-trip. Do NOT declare
+    # preprocessed/non-RGB tensors (e.g. VAE-ready video tensors, latents) -- PIL
+    # conversion would be lossy and break tensor consumers; non-image columns that
+    # must stay python belong in ``dataset.EXTRA_PYTHON_FORMAT_COLUMNS``, not here.
+    # The raw modality column ``images`` is always handled as images by the dataset
+    # itself, independent of this declaration.
+    python_format_columns: ClassVar[frozenset[str]] = frozenset()
+
+    # Resolution-invariant latent axis roles for the model-agnostic latent state
+    # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via
+    # `resolve_latent_axes`, which covers every standard 3D/4D/5D layout. Adapters
+    # with a non-standard layout may override this with an explicit `LatentAxes`.
+    LATENT_AXES: ClassVar[Optional[LatentAxes]] = None
+
+    # DDP-only knob (ignored under FSDP/DeepSpeed). Set True only for adapters
+    # whose training step can leave some trainable parameters without a gradient
+    # in a given iteration (e.g. Qwen-Image: guidance=None leaves the guidance
+    # embedder unused). The default False lets DDP use static buckets and overlap
+    # gradient all-reduce with backward; if an adapter actually needs True but
+    # leaves it False, DDP fails fast at the first backward with an explicit
+    # "didn't receive grad" error rather than silently producing wrong results.
+    ddp_find_unused_parameters: ClassVar[bool] = False
+
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__()
         self.config = config
         self.accelerator = accelerator
         self.model_args = config.model_args
         self.training_args = config.training_args
         self.eval_args = config.eval_args
-        self._mode : str = 'train' # ['train', 'eval', 'rollout']
-        self._named_parameters : Dict[str, NamedParametersInfo] = {}
+        self._mode: str = "train"  # ['train', 'eval', 'rollout']
+        self._named_parameters: Dict[str, NamedParametersInfo] = {}
 
         # Load pipeline and scheduler (delegated to subclasses)
         self.pipeline = self.load_pipeline()
         self.pipeline.scheduler = self.load_scheduler()
-        
+
         # Initialize prepared components cache
         self._components: Dict[str, torch.nn.Module] = {}
-        self._prepared_components: set[str] = set()
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
 
-        # Load checkpoint
-        if self.model_args.resume_path:
+        # Load checkpoint.
+        # 'lora'/'full' load into the unwrapped pipeline modules here (before prepare()).
+        # 'state' is deferred to post_init(): accelerator.load_state() only restores into
+        # modules/optimizer registered by accelerator.prepare(), which the trainer runs later.
+        if self.model_args.resume_path and self.model_args.resume_type != "state":
             self.load_checkpoint(
-                self.model_args.resume_path,
-                resume_type=self.model_args.resume_type
+                self.model_args.resume_path, resume_type=self.model_args.resume_type
             )
+
+        # Merge LoRA adapters into base model when transitioning to full fine-tuning
+        if self.model_args.resume_path and self.model_args.finetune_type != "lora":
+            self._merge_lora_if_needed()
 
         # Freeze non-trainable components
         self._freeze_components()
 
         # Apply LoRA if needed
-        if self.model_args.finetune_type == 'lora':
+        if self.model_args.finetune_type == "lora":
             self.apply_lora(
                 target_modules=self.model_args.target_modules,
                 components=self.model_args.target_components,
-                overwrite=False, # Do not overwrite existing adapters
+                overwrite=False,  # Do not overwrite existing adapters
             )
 
         # Set precision
@@ -154,16 +207,23 @@ class BaseAdapter(ABC):
     # ================================== Post Init =================================
     def post_init(self):
         """Hook for additional initialization after main trainer's `accelerator.prepare`."""
+        # Full training-state resume must happen here: accelerator.prepare() has now
+        # registered the trainable modules and optimizer, so accelerator.load_state()
+        # can actually restore model + optimizer + RNG (and any other prepared objects).
+        if self.model_args.resume_path and self.model_args.resume_type == "state":
+            self.load_checkpoint(self.model_args.resume_path, resume_type="state")
         self._init_ema()
         self._init_ref_parameters()
 
     # ============================== Latent Casting =================================
     @property
     def latent_storage_dtype(self) -> Optional[torch.dtype]:
-        val = getattr(self.training_args, 'latent_storage_dtype', None)
+        val = getattr(self.training_args, "latent_storage_dtype", None)
         return self._DTYPE_MAP.get(val) if val else None
 
-    def cast_latents(self, latents: torch.Tensor, default_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    def cast_latents(
+        self, latents: torch.Tensor, default_dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         """Cast latents to storage dtype with float16 overflow protection."""
         target = self.latent_storage_dtype or default_dtype
         if target is None or latents.dtype == target:
@@ -191,26 +251,43 @@ class BaseAdapter(ABC):
 
     # ============================== Component Accessors ==============================
     # ---------------------------------- Wrappers ----------------------------------
-    def _unwrap(self, model: torch.nn.Module) -> torch.nn.Module:
-        """Get the unwrapped model from accelerator."""
+    def _unwrap(self, model: Union[torch.nn.Module, RoutedComponentProxy]) -> torch.nn.Module:
+        """Get the unwrapped model.
+
+        Peels a `RoutedComponentProxy` to its inner module first (the proxy is
+        installed as a component after `accelerator.prepare`), then strips the
+        accelerator wrapper (DDP/FSDP/DeepSpeed).
+        """
+        if isinstance(model, RoutedComponentProxy):
+            model = model.inner
         return self.accelerator.unwrap_model(model)
 
-    def set_component(self, name: str, module: torch.nn.Module, prepared: bool = False):
-        """Set a component and track whether accelerator owns its device placement."""
-        self._components[name] = module
-        if prepared:
-            self._prepared_components.add(name)
-        else:
-            self._prepared_components.discard(name)
-    
+    def set_component(self, name: str, module: Union[torch.nn.Module, RoutedComponentProxy]):
+        """Cache a component for this name.
+
+        Accepts either a real ``nn.Module`` (a prepared module, a freshly loaded
+        checkpoint module, etc.) or a transparent ``RoutedComponentProxy``
+        installed after ``accelerator.prepare``. The proxy is stored as an
+        ``nn.Module`` stand-in (it duck-types one), so the cast is the single,
+        encapsulated acknowledgement of that contract; readers via
+        ``get_component`` see a plain ``nn.Module``.
+        """
+        self._components[name] = cast(torch.nn.Module, module)
+
     def get_component(self, name: str) -> torch.nn.Module:
-        """Get a component, preferring the prepared version if available."""
+        """Get a component, preferring the prepared version if available.
+
+        After `accelerator.prepare`, trainable/bundled components resolve to a
+        transparent `RoutedComponentProxy` (a duck-typed nn.Module stand-in)
+        that routes forwards through the prepared root; use ``_unwrap`` to recover
+        the real module.
+        """
         return self._components.get(name) or getattr(self.pipeline, name)
 
     def get_component_unwrapped(self, name: str) -> torch.nn.Module:
         """Get the original unwrapped component."""
         return getattr(self.pipeline, name)
-    
+
     def get_component_config(self, name: str):
         """Get the config of a component."""
         return getattr(self.pipeline, name).config
@@ -220,7 +297,7 @@ class BaseAdapter(ABC):
         components = [getattr(self.pipeline, name) for name in component_names]
         prepared = accelerator.prepare(*components)
         for name, module in zip(component_names, prepared):
-            self.set_component(name, module, prepared=True)
+            self.set_component(name, module)
         return prepared
 
     # ------------------------------ Text Encoders & Tokenizers ------------------------------
@@ -228,9 +305,10 @@ class BaseAdapter(ABC):
     def text_encoder_names(self) -> List[str]:
         """Get all text encoder component names from pipeline."""
         names = [
-            name for name, value in vars(self.pipeline).items()
-            if 'text_encoder' in name
-            and not name.startswith('_')
+            name
+            for name, value in vars(self.pipeline).items()
+            if "text_encoder" in name
+            and not name.startswith("_")
             and isinstance(value, torch.nn.Module)
         ]
         return sorted(names)
@@ -243,19 +321,19 @@ class BaseAdapter(ABC):
     @property
     def text_encoder(self) -> torch.nn.Module:
         """Get the primary text encoder."""
-        return self.get_component('text_encoder')
+        return self.get_component("text_encoder")
 
     @text_encoder.setter
     def text_encoder(self, module: torch.nn.Module):
-        self.set_component('text_encoder', module)
+        self.set_component("text_encoder", module)
 
     @property
     def tokenizer_names(self) -> List[str]:
         """Get all tokenizer names from pipeline."""
         names = [
-            name for name, value in vars(self.pipeline).items()
-            if 'tokenizer' in name
-            and not name.startswith('_')
+            name
+            for name, value in vars(self.pipeline).items()
+            if "tokenizer" in name and not name.startswith("_")
         ]
         return sorted(names)
 
@@ -276,20 +354,31 @@ class BaseAdapter(ABC):
     @property
     def vae(self) -> torch.nn.Module:
         """Get VAE, preferring prepared version."""
-        return self.get_component('vae')
+        return self.get_component("vae")
 
     @vae.setter
     def vae(self, module: torch.nn.Module):
-        self.set_component('vae', module)
+        self.set_component("vae", module)
+
+    # ------------------------------------ Audio VAE ------------------------------------
+    @property
+    def audio_vae(self) -> Optional[torch.nn.Module]:
+        """Get audio VAE if available in pipeline, preferring prepared version."""
+        return self._components.get("audio_vae") or getattr(self.pipeline, "audio_vae", None)
+
+    @audio_vae.setter
+    def audio_vae(self, module: torch.nn.Module):
+        self.set_component("audio_vae", module)
 
     # ---------------------------------- Transformers ----------------------------------
     @property
     def transformer_names(self) -> List[str]:
         """Get all transformer component names."""
         names = [
-            name for name, value in vars(self.pipeline).items()
-            if 'transformer' in name
-            and not name.startswith('_')
+            name
+            for name, value in vars(self.pipeline).items()
+            if "transformer" in name
+            and not name.startswith("_")
             and isinstance(value, torch.nn.Module)
         ]
         return sorted(names)
@@ -301,15 +390,15 @@ class BaseAdapter(ABC):
 
     @property
     def transformer(self) -> torch.nn.Module:
-        return self.get_component('transformer')
+        return self.get_component("transformer")
 
     @transformer.setter
     def transformer(self, module: torch.nn.Module):
-        self.set_component('transformer', module)
+        self.set_component("transformer", module)
 
     @property
     def transformer_config(self):
-        return self.get_component_config('transformer')
+        return self.get_component_config("transformer")
 
     # ------------------------------------ Scheduler ------------------------------------
     @property
@@ -324,7 +413,7 @@ class BaseAdapter(ABC):
     @property
     def device(self) -> torch.device:
         return self.accelerator.device
-    
+
     @property
     def _inference_dtype(self) -> torch.dtype:
         """Get inference dtype based on mixed precision setting."""
@@ -343,43 +432,43 @@ class BaseAdapter(ABC):
 
     def eval(self):
         """Set all target components to evaluation mode."""
-        self._mode = 'eval'
+        self._mode = "eval"
         for name in self.trainable_component_names:
             self.get_component(name).eval()
-        if hasattr(self.scheduler, 'eval'):
+        if hasattr(self.scheduler, "eval"):
             self.scheduler.eval()
 
     def rollout(self, *args, **kwargs):
         """Set model to rollout mode."""
-        self._mode = 'rollout'
+        self._mode = "rollout"
         for name in self.trainable_component_names:
             self.get_component(name).eval()
-        if hasattr(self.scheduler, 'rollout'):
+        if hasattr(self.scheduler, "rollout"):
             self.scheduler.rollout(*args, **kwargs)
 
     def train(self, mode: bool = True):
         """Set trainable components to training mode."""
-        self._mode = 'train' if mode else 'eval'
+        self._mode = "train" if mode else "eval"
         for name in self.trainable_component_names:
             self.get_component(name).train(mode)
-        if hasattr(self.scheduler, 'train'):
+        if hasattr(self.scheduler, "train"):
             self.scheduler.train(mode=mode)
 
     # ============================== Target Modules ==============================
     @property
     def default_target_modules(self) -> List[str]:
         """Default target modules for training."""
-        return ['to_q', 'to_k', 'to_v', 'to_out.0']
+        return ["to_q", "to_k", "to_v", "to_out.0"]
 
     @property
     def preprocessing_modules(self) -> List[str]:
         """Modules that are requires for preprocessing"""
-        return ['text_encoders', 'vae']
-    
+        return ["text_encoders", "vae"]
+
     @property
     def inference_modules(self) -> List[str]:
         """Modules that are required for inference and forward"""
-        return ['transformer', 'vae']
+        return ["transformer", "vae"]
 
     @property
     def trainable_component_names(self) -> List[str]:
@@ -392,46 +481,42 @@ class BaseAdapter(ABC):
         return [self.get_component(name) for name in self.trainable_component_names]
 
     def _merge_module_pattern(
-        self,
-        current_pattern: Union[str, List[str], Set[str]],
-        new_pattern: str
+        self, current_pattern: Union[str, List[str], Set[str]], new_pattern: str
     ) -> Union[str, Set[str]]:
         """
         Resolve pattern and merge into current modules.
-        
+
         Args:
             current: Current state ('all' or list of modules)
             pattern: New pattern to merge ('all', 'default', or module name)
-        
+
         Returns:
             'all' or updated module list
         """
         # 'all' is absorbing - once set, stays 'all'
-        if current_pattern == 'all' or new_pattern == 'all':
-            return 'all'
-        
+        if current_pattern == "all" or new_pattern == "all":
+            return "all"
+
         # Resolve pattern to module list
-        new_modules = self.default_target_modules if new_pattern == 'default' else [new_pattern]
+        new_modules = self.default_target_modules if new_pattern == "default" else [new_pattern]
         new_pattern_set = set(current_pattern) | set(new_modules)
         return new_pattern_set
 
     def _parse_target_modules(
-        self,
-        target_modules: Union[str, List[str]],
-        components: Union[str, List[str]]
+        self, target_modules: Union[str, List[str]], components: Union[str, List[str]]
     ) -> Dict[str, Union[List[str], None]]:
         """
         Parse target_modules config into component-specific mapping.
-        
+
         Args:
-            target_modules: 
+            target_modules:
                 - 'default': Use self.default_target_modules
                 - 'all': Unfreeze all parameters
                 - str: Single module pattern
                 - List[str]: Module patterns with optional component prefix
             components: Union[str, List[str]]
                 - Component(s) to apply target_modules to.
-        
+
         Returns:
             Dict mapping component names to their target modules.
             Example: {
@@ -445,37 +530,41 @@ class BaseAdapter(ABC):
             components = [components]
         if isinstance(target_modules, str):
             target_modules = [target_modules]
-        
+
         component_map = {comp: set() for comp in components}
-        
+
         for module in target_modules:
-            parts = module.split('.', 1)
+            parts = module.split(".", 1)
             if len(parts) == 2 and parts[0] in components:
-                component_map[parts[0]] = self._merge_module_pattern(component_map[parts[0]], parts[1])
+                component_map[parts[0]] = self._merge_module_pattern(
+                    component_map[parts[0]], parts[1]
+                )
             else:
                 for comp in components:
                     component_map[comp] = self._merge_module_pattern(component_map[comp], module)
 
         # Remove duplicates and handle empty lists
         component_map = {
-            comp: ('all' if mods == 'all' else sorted(mods) if mods else None) # Keep None here, to enable `accelerator.prepare` for non-trainable module to save mem.
+            comp: (
+                "all" if mods == "all" else sorted(mods) if mods else None
+            )  # Keep None here, to enable `accelerator.prepare` for non-trainable module to save mem.
             for comp, mods in component_map.items()
         }
-        
+
         return component_map
-    
+
     def _init_target_module_map(self) -> Dict[str, Union[List[str], None]]:
         """
         Initialize and cache target module mapping from config.
-        
+
         Returns:
             Dict mapping component names to their target modules.
         """
         component_map = self._parse_target_modules(
             target_modules=self.model_args.target_modules,
-            components=self.model_args.target_components
+            components=self.model_args.target_components,
         )
-                
+
         return component_map
 
     # ============================== EMA Management ==============================
@@ -483,8 +572,8 @@ class BaseAdapter(ABC):
         """Initialize EMA wrapper for the transformer."""
         if self.training_args.ema_decay > 0:
             ema_device = (
-                self.accelerator.device 
-                if self.training_args.ema_device == "cuda" 
+                self.accelerator.device
+                if self.training_args.ema_device == "cuda"
                 else torch.device("cpu")
             )
             self.ema_wrapper = EMAModuleWrapper(
@@ -494,23 +583,19 @@ class BaseAdapter(ABC):
                 device=ema_device,
                 decay_schedule=self.training_args.ema_decay_schedule,
                 # Pass decay schedule params from training_args
-                **self.training_args
+                **self.training_args,
             )
         else:
             self.ema_wrapper = None
-    
-    def ema_step(self, step : int):
-        """Update EMA parameters."""
-        if hasattr(self, 'ema_wrapper') and self.ema_wrapper is not None:
-            self.ema_wrapper.step(
-                self.get_trainable_parameters(),
-                optimization_step=step
-            )
 
+    def ema_step(self, step: int):
+        """Update EMA parameters."""
+        if hasattr(self, "ema_wrapper") and self.ema_wrapper is not None:
+            self.ema_wrapper.step(self.get_trainable_parameters(), optimization_step=step)
 
     @contextmanager
     def use_ema_parameters(self):
-        if hasattr(self, 'ema_wrapper') and self.ema_wrapper is not None:
+        if hasattr(self, "ema_wrapper") and self.ema_wrapper is not None:
             trainable_params = self.get_trainable_parameters()
             with self.ema_wrapper.use_ema_parameters(trainable_params):
                 yield
@@ -520,16 +605,13 @@ class BaseAdapter(ABC):
     # ============================== Reference Parameters ==============================
     def _init_ref_parameters(self):
         """
-            Initialize reference parameters for target components.
-            Used for KL regularization during training.
+        Initialize reference parameters for target components.
+        Used for KL regularization during training.
         """
-        if (
-            self.training_args.requires_ref_model
-            and self.model_args.finetune_type in ['full']
-        ):
+        if self.training_args.requires_ref_model and self.model_args.finetune_type in ["full"]:
             ref_param_device = (
-                self.accelerator.device 
-                if self.training_args.ref_param_device == "cuda" 
+                self.accelerator.device
+                if self.training_args.ref_param_device == "cuda"
                 else torch.device("cpu")
             )
             self._ref_ema = EMAModuleWrapper(
@@ -544,7 +626,7 @@ class BaseAdapter(ABC):
     @contextmanager
     def use_ref_parameters(self):
         """Context manager to use reference parameters."""
-        if self.model_args.finetune_type == 'lora':
+        if self.model_args.finetune_type == "lora":
             # Use ExitStack to manage multiple context managers (one per component)
             with ExitStack() as stack:
                 enabled_any = False
@@ -574,7 +656,6 @@ class BaseAdapter(ABC):
         else:
             yield
 
-
     # ============================== Named Parameters Snapshot ==============================
     """
         These utilities help to snapshot and restore named parameters for target components.
@@ -584,10 +665,8 @@ class BaseAdapter(ABC):
         So we need more flexible utilities to manage multiple named parameter snapshots.
         The functions below help to store, use, update, and remove named parameter snapshots.
     """
-    def _get_component_parameters(
-        self, 
-        target_modules: List[str]
-    ) -> List[torch.nn.Parameter]:
+
+    def _get_component_parameters(self, target_modules: List[str]) -> List[torch.nn.Parameter]:
         """Get trainable parameters from specified components."""
         params = []
         for comp_name in target_modules:
@@ -597,7 +676,7 @@ class BaseAdapter(ABC):
             else:
                 logger.warning(f"Component '{comp_name}' not found in the model. Skipping.")
         return params
-    
+
     def add_named_parameters(
         self,
         name: str,
@@ -607,7 +686,7 @@ class BaseAdapter(ABC):
     ) -> None:
         """
         Store current trainable parameters snapshot under a name.
-        
+
         Args:
             name: Identifier for this parameter snapshot
             target_modules: Component names to store. Defaults to components with trainable params.
@@ -616,24 +695,26 @@ class BaseAdapter(ABC):
         """
         if name in self._named_parameters and not overwrite:
             raise KeyError(f"Named parameters '{name}' exists. Use overwrite=True.")
-        
+
         # Normalize target_modules - filter only those with trainable params
         if target_components is None:
             target_components = [k for k, v in self.target_module_map.items() if v]
         elif isinstance(target_components, str):
             target_components = [target_components]
-        
+
         # Validate
         invalid = set(target_components) - set(self.target_module_map.keys())
         if invalid:
-            raise ValueError(f"Invalid target_modules: {invalid}. Valid: {list(self.target_module_map.keys())}")
-        
-        device = torch.device(device) if device else torch.device('cpu')
+            raise ValueError(
+                f"Invalid target_modules: {invalid}. Valid: {list(self.target_module_map.keys())}"
+            )
+
+        device = torch.device(device) if device else torch.device("cpu")
         params = self._get_component_parameters(target_components)
-        
+
         if not params:
             raise ValueError(f"No trainable parameters found in {target_components}")
-        
+
         self._named_parameters[name] = NamedParametersInfo(
             target_components=target_components,
             ema_wrapper=EMAModuleWrapper(
@@ -644,15 +725,15 @@ class BaseAdapter(ABC):
             ),
         )
         logger.info(f"Stored named parameters '{name}' for {target_components} on {device}")
-    
+
     @contextmanager
     def use_named_parameters(self, name: str):
         """
         Context manager to temporarily use named parameters.
-        
+
         Args:
             name: Name of stored parameters snapshot
-            
+
         Usage:
             adapter.add_named_parameters('init')
             # ... training ...
@@ -662,10 +743,10 @@ class BaseAdapter(ABC):
         """
         if name not in self._named_parameters:
             raise KeyError(f"'{name}' not found. Available: {self.list_named_parameters()}")
-        
+
         info = self._named_parameters[name]
         params = self._get_component_parameters(info.target_components)
-        
+
         with info.ema_wrapper.use_ema_parameters(params):
             yield
 
@@ -677,7 +758,7 @@ class BaseAdapter(ABC):
     ) -> None:
         """
         Update existing named parameters with specified or current values.
-        
+
         Args:
             name: Name of snapshot to update
             target_modules: Components to update. Defaults to originally stored components.
@@ -685,36 +766,38 @@ class BaseAdapter(ABC):
         """
         if name not in self._named_parameters:
             raise KeyError(f"'{name}' not found.")
-        
+
         info = self._named_parameters[name]
-        
+
         # Resolve target_modules
         if target_components is None:
             target_components = info.target_components
         elif isinstance(target_components, str):
             target_components = [target_components]
-        
+
         if not set(target_components).issubset(set(info.target_components)):
             raise ValueError(f"Must be subset of original: {info.target_components}")
-        
+
         # Resolve parameters
         if new_parameters is None:
             new_parameters = self._get_component_parameters(target_components)
         else:
             new_parameters = list(new_parameters)
-        
+
         # Validate param count
         if len(new_parameters) != len(info.ema_wrapper.ema_parameters):
             raise ValueError(
                 f"Parameter count mismatch: got {len(new_parameters)}, "
                 f"expected {len(info.ema_wrapper.ema_parameters)}"
             )
-        
+
         # Update
         with torch.no_grad():
-            for ema_param, param in zip(info.ema_wrapper.ema_parameters, new_parameters, strict=True):
+            for ema_param, param in zip(
+                info.ema_wrapper.ema_parameters, new_parameters, strict=True
+            ):
                 ema_param.data.copy_(param.detach().to(ema_param.device))
-        
+
         logger.info(f"Updated named parameters '{name}'")
 
     def remove_named_parameters(self, name: str) -> None:
@@ -727,7 +810,7 @@ class BaseAdapter(ABC):
     def list_named_parameters(self) -> List[str]:
         """List all stored parameter names."""
         return list(self._named_parameters.keys())
-    
+
     def get_named_parameters_info(self, name: str) -> Dict[str, Any]:
         """Get info about a named parameter snapshot."""
         if name not in self._named_parameters:
@@ -760,7 +843,7 @@ class BaseAdapter(ABC):
         for comp_name in self.model_args.target_components:
             if hasattr(self, comp_name):
                 component = self.get_component(comp_name)
-                if hasattr(component, 'enable_gradient_checkpointing'):
+                if hasattr(component, "enable_gradient_checkpointing"):
                     component.enable_gradient_checkpointing()
                     logger.info(f"Enabled gradient checkpointing for {comp_name}")
                 else:
@@ -777,10 +860,10 @@ class BaseAdapter(ABC):
         backend = self.model_args.attn_backend
         if backend is None:
             return
-        
+
         for transformer_name in self.transformer_names:
             transformer = self.get_component(transformer_name)
-            if hasattr(transformer, 'set_attention_backend'):
+            if hasattr(transformer, "set_attention_backend"):
                 transformer.set_attention_backend(backend)
                 if self.accelerator.is_main_process:
                     logger.info(f"Set attention backend '{backend}' for {transformer_name}")
@@ -790,69 +873,103 @@ class BaseAdapter(ABC):
         self,
         component: torch.nn.Module,
         train_dtype: torch.dtype,
-        frozen_dtype: torch.dtype,
+        frozen_dtype: Optional[torch.dtype],
     ) -> int:
         """
         Set floating-point parameters/buffers without a trainable round-trip through frozen_dtype.
 
-        Trainable parameters use ``train_dtype``; frozen parameters and floating-point buffers use
-        ``frozen_dtype``. Integer/bool buffers are left unchanged (same as ``Module.to``).
-        """ 
+        Trainable parameters use ``train_dtype``. Frozen parameters and floating-point buffers use
+        ``frozen_dtype`` when it is set, or are left at their loaded dtype when ``frozen_dtype`` is
+        ``None`` (preserve). Integer/bool buffers are left unchanged (same as ``Module.to``).
+        """
         n_trainable = 0
         for _, param in component.named_parameters():
             if param.requires_grad:
                 param.data = param.data.to(dtype=train_dtype)
                 n_trainable += 1
-            else:
+            elif frozen_dtype is not None:
                 param.data = param.data.to(dtype=frozen_dtype)
         for _, buf in component.named_buffers():
-            if buf.is_floating_point():
+            if buf.is_floating_point() and frozen_dtype is not None:
                 buf.data = buf.data.to(dtype=frozen_dtype)
         return n_trainable
 
     def _mix_precision(self):
-        """Apply mixed precision to default pipeline modules plus any extra ``target_components`` names."""
-        # Get inference and master dtypes
-        inference_dtype = self._inference_dtype
-        master_dtype = self.model_args.master_weight_dtype
+        """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
+        and floating-point buffers at their loaded (``from_pretrained``) dtype.
 
-        # Get target components and all component names
+        This is the single place that decides every parameter's *original* dtype before
+        ``accelerator.prepare``; the trainer only bundles + prepares.
+
+        Frozen-dtype policy: ``frozen_parameters_dtype=None`` (default) preserves each frozen
+        parameter/buffer's original dtype and never downcasts -- a released checkpoint deliberately
+        ships components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16), and
+        forcing one uniform frozen dtype would override those choices. Set an explicit
+        ``frozen_parameters_dtype`` to opt into casting every frozen param to that dtype.
+
+        FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
+        trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
+        that also bundles frozen members (e.g. Wan2.2 trains ``transformer`` while ``transformer_2``
+        is frozen-but-sharded) would otherwise mix fp32/low-precision within a unit and trip FSDP2's
+        uniform-dtype assert. We therefore force the TRAINED components to a uniform fp32 original
+        dtype here (compute stays low-precision via accelerate's ``MixedPrecisionPolicy``); untrained
+        components are cast to ``frozen_parameters_dtype`` when set, else preserved.
+        """
+        train_dtype = self.model_args.trainable_parameters_dtype
+        frozen_dtype = self.model_args.frozen_parameters_dtype  # None -> preserve loaded dtype
+
         target_set = frozenset(self.model_args.target_components)
         component_names = self._resolve_component_names(None)
         merged_names = list(dict.fromkeys([*component_names, *self.model_args.target_components]))
 
-        # If master dtype is the same as inference dtype, cast all components to inference dtype
-        if master_dtype == inference_dtype:
-            # Cast all components to inference dtype
+        # FSDP2: trained (sharded) components need a uniform fp32 original dtype.
+        if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
-                self.get_component(name).to(dtype=inference_dtype)
+                if name in target_set:
+                    self.get_component(name).to(dtype=torch.float32)
+                elif frozen_dtype is not None:
+                    self.get_component(name).to(dtype=frozen_dtype)
+                # else: preserve the untrained component's loaded dtype
+            logger.info(
+                f"FSDP2: trained components -> fp32 (uniform orig dtype); "
+                f"other components -> {frozen_dtype or 'preserved (loaded dtype)'}"
+            )
             return
 
+        # Explicit uniform dtype -> a single cast of every component suffices.
+        if frozen_dtype is not None and train_dtype == frozen_dtype:
+            for name in merged_names:
+                self.get_component(name).to(dtype=frozen_dtype)
+            return
+
+        # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
         trainable_count = 0
         for name in merged_names:
             component = self.get_component(name)
             if name in target_set:
-                # Cast trainable parameters to master dtype
                 trainable_count += self._cast_module_mixed_precision(
-                    component, master_dtype, inference_dtype
+                    component, train_dtype, frozen_dtype
                 )
-            else:
-                # Cast frozen parameters to inference dtype
-                component.to(dtype=inference_dtype)
+            elif frozen_dtype is not None:
+                component.to(dtype=frozen_dtype)
+            # else: preserve the fully-frozen component's loaded dtype
 
         if trainable_count > 0:
-            logger.info(f"Set {trainable_count} trainable parameters to {master_dtype}")
+            logger.info(
+                f"Set {trainable_count} trainable parameters to {train_dtype}; "
+                f"frozen params -> {frozen_dtype or 'preserved (loaded dtype)'}"
+            )
 
     # ============================== LoRA Management ==============================
     def apply_lora(
         self,
         target_modules: Union[str, List[str]],
-        components: Union[str, List[str]] = 'transformer',
+        components: Union[str, List[str]] = "transformer",
         overwrite: bool = False,
     ) -> Union[PeftModel, Dict[str, PeftModel]]:
         """
         Apply LoRA adapters to specified components with prefix-based module targeting.
-        
+
         Args:
             target_modules: Module patterns with optional component prefix
                 - 'to_q': Apply to all components in `components`
@@ -867,19 +984,19 @@ class BaseAdapter(ABC):
         # Normalize components to list
         if isinstance(components, str):
             components = [components]
-        
+
         # Parse with explicit target_modules
         component_modules = self._parse_target_modules(target_modules, components)
         # Apply LoRA to each component
         results = {}
         for comp in components:
             modules = component_modules.get(comp)
-            
+
             # Handle special cases
-            if modules == 'default':
+            if modules == "default":
                 modules = self.default_target_modules
-            elif modules == 'all':
-                modules = 'all' # Keep as 'all' for PEFT
+            elif modules == "all":
+                modules = "all"  # Keep as 'all' for PEFT
             elif not modules:
                 logger.warning(f"No target modules for {comp}, skipping LoRA")
                 continue
@@ -897,7 +1014,9 @@ class BaseAdapter(ABC):
                 # Already a PeftModel, check for existing adapter
                 has_default = "default" in model_component.peft_config
                 if has_default and not overwrite:
-                    logger.info(f"Component {comp} already has 'default' adapter. Skipping initialization but enabling gradients.")
+                    logger.info(
+                        f"Component {comp} already has 'default' adapter. Skipping initialization but enabling gradients."
+                    )
                     # We must unfreeze the lora parameters because `_freeze_components` might have frozen them!
                     for name, param in model_component.named_parameters():
                         if any(k in name for k in self.lora_keys):
@@ -923,13 +1042,13 @@ class BaseAdapter(ABC):
                 model_component = get_peft_model(model_component, lora_config)
                 # Set back to attribute
                 self.set_component(comp, model_component)
-         
+
             # Activate the adapter
             model_component.set_adapter("default")
             results[comp] = model_component
-            
+
             logger.info(f"Applied LoRA to {comp} with modules: {modules}")
-        
+
         if not results:
             logger.warning("No LoRA adapters were applied")
             return {}
@@ -954,7 +1073,7 @@ class BaseAdapter(ABC):
 
     def _is_fsdp2(self) -> bool:
         """Check if FSDP2 is enabled."""
-        return getattr(self.accelerator, 'is_fsdp2', False)
+        return getattr(self.accelerator, "is_fsdp2", False)
 
     def _is_fsdp_cpu_efficient_loading(self) -> bool:
         """Check if FSDP efficient loading is enabled."""
@@ -979,6 +1098,7 @@ class BaseAdapter(ABC):
         if fsdp_plugin is None:
             return False
         from torch.distributed.fsdp import ShardingStrategy
+
         return fsdp_plugin.sharding_strategy in (
             ShardingStrategy.FULL_SHARD,
             ShardingStrategy.HYBRID_SHARD,
@@ -996,6 +1116,7 @@ class BaseAdapter(ABC):
     def _is_fsdp_collective_state_dict(self) -> bool:
         """Check if FSDP state_dict_type requires collective operations."""
         from torch.distributed.fsdp import StateDictType
+
         state_dict_type = self._fsdp_state_dict_type()
         if state_dict_type is None:
             return False
@@ -1006,11 +1127,10 @@ class BaseAdapter(ABC):
         """Check if parameters are sharded across ranks."""
         return self._is_zero3() or self._is_fsdp2() or self._is_fsdp_param_sharded()
 
-
     def _requires_collective_state_dict(self) -> bool:
         """
         Check if state_dict gathering requires all ranks to participate.
-        
+
         This is True when:
         - DeepSpeed ZeRO-3 (parameters sharded)
         - FSDP2 (always uses collective ops)
@@ -1022,14 +1142,12 @@ class BaseAdapter(ABC):
         if self._is_fsdp2():
             return True
         if self._is_fsdp() and (
-            self._is_fsdp_param_sharded()
-            or self._is_fsdp_collective_state_dict()
+            self._is_fsdp_param_sharded() or self._is_fsdp_collective_state_dict()
         ):
             return True
         return False
 
     # ============================== Checkpoint Management ==============================
-
 
     # ------------------------------ State Dict ------------------------------------------
 
@@ -1038,7 +1156,7 @@ class BaseAdapter(ABC):
         model,
         unwrap=True,
         state_dict_keys: Optional[Iterable[str]] = None,
-        ignore_frozen_params : bool = False,
+        ignore_frozen_params: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         **Modified from `Accelerator.get_state_dict`**
@@ -1056,11 +1174,12 @@ class BaseAdapter(ABC):
                 when you only want to save the trainable parameters.
             ignore_frozen_params (`bool`, *optional*, defaults to `False`):
                 For FSDP2 only. If `True`, frozen parameters (i.e., those with `requires_grad=False`) will be ignored when saving the state dict.
-                
+
         Returns:
             `dict`: The state dictionary of the model potentially without full precision.
         ```
         """
+
         def is_param_match_key(name, keys, strict=True):
             if keys is None:
                 return not strict  # strict: no keys → no match; non-strict: no keys → match all
@@ -1074,7 +1193,10 @@ class BaseAdapter(ABC):
 
         if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
             zero3_sharding = self.accelerator.deepspeed_config["zero_optimization"]["stage"] == 3
-            tp_sharding = self.accelerator.deepspeed_config.get("tensor_parallel", {}).get("autotp_size", 0) > 1
+            tp_sharding = (
+                self.accelerator.deepspeed_config.get("tensor_parallel", {}).get("autotp_size", 0)
+                > 1
+            )
             if zero3_sharding or tp_sharding:
                 if model.zero_gather_16bit_weights_on_model_save():
                     ver_min_required = "0.16.4"
@@ -1097,45 +1219,33 @@ class BaseAdapter(ABC):
             else:
                 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
-                state_dict = clone_tensors_for_torch_save(self.accelerator.unwrap_model(model).state_dict())
+                state_dict = clone_tensors_for_torch_save(self._unwrap(model).state_dict())
         elif self.accelerator.is_fsdp2:
-            # FSDP/FSDP2
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-            if state_dict_keys is not None:
-                # Temporarily mark unwanted params as frozen
-                # This `requires_grad` trick does not work correctly. Don't know why.
-                original_state = {}
-                
-                # Freeze unwanted params
-                for name, param in model.named_parameters():
-                    original_state[name] = param.requires_grad
-                    param.requires_grad = is_param_match_key(name, state_dict_keys)
-                
-                options = StateDictOptions(
-                    full_state_dict=True,
-                    broadcast_from_rank0=True,
-                    cpu_offload=True,
-                    ignore_frozen_params=True,
-                )
-                state_dict = get_model_state_dict(model, options=options)
-                
-                # Restore original state
-                for name, param in model.named_parameters():
-                    param.requires_grad = original_state[name]
-            else:
-                options = StateDictOptions(
-                    full_state_dict=True, 
-                    broadcast_from_rank0=True, 
-                    cpu_offload=True, 
-                    ignore_frozen_params=ignore_frozen_params
-                )
-                state_dict = get_model_state_dict(model, options=options)
+            # FSDP2: gather the full (unsharded) params to rank0 via the DTensor-aware API.
+            # NOTE: the previous `state_dict_keys` path toggled `requires_grad` at runtime to
+            # sub-select params, but FSDP2's `ignore_frozen_params` is keyed off the trainability
+            # captured at `fully_shard` time -- the runtime toggle is a no-op, so it yielded an
+            # EMPTY adapter. Gather straight through (LoRA params are exactly the trainable subset,
+            # so `ignore_frozen_params=True` returns them) and let the shared key-filter below
+            # narrow to `state_dict_keys` when provided.
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+            )
+
+            options = StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+                cpu_offload=True,
+                ignore_frozen_params=ignore_frozen_params,
+            )
+            state_dict = get_model_state_dict(model, options=options)
         elif self.accelerator.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.checkpoint.state_dict import (
                 get_state_dict as fsdp_get_state_dict,
-                get_model_state_dict as fsdp_get_model_state_dict
+                get_model_state_dict as fsdp_get_model_state_dict,
             )
 
             full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -1143,17 +1253,18 @@ class BaseAdapter(ABC):
                 state_dict = model.state_dict()
         else:
             if unwrap:
-                model = self.accelerator.unwrap_model(model)
+                model = self._unwrap(model)
             state_dict = model.state_dict()
 
         # Filter by keys.
         state_dict = {
-            k: v for k, v in state_dict.items()
+            k: v
+            for k, v in state_dict.items()
             if is_param_match_key(k, state_dict_keys, strict=False)
         }
 
         return state_dict
-    
+
     @classmethod
     def _filter_lora_state_dict(
         cls,
@@ -1162,28 +1273,25 @@ class BaseAdapter(ABC):
     ) -> Dict[str, torch.Tensor]:
         """
         Filter state dict to only include LoRA parameters.
-        
+
         Args:
             state_dict: Full model state dict
             adapter_name: Name of the LoRA adapter (default: "default")
-        
+
         Returns:
             State dict containing only LoRA-related weights
         """
-        return {
-            k: v for k, v in state_dict.items()
-            if any(lk in k for lk in cls.lora_keys)
-        }
-    
+        return {k: v for k, v in state_dict.items() if any(lk in k for lk in cls.lora_keys)}
+
     # -------------------------------------------- Save ------------------------------------
     def _save_lora(
         self,
         model: torch.nn.Module,
         save_directory: str,
     ) -> None:
-        """Save LoRA adapter with distributed training support."""        
-        unwrapped = self.accelerator.unwrap_model(model)
-        
+        """Save LoRA adapter with distributed training support."""
+        unwrapped = self._unwrap(model)
+
         if not isinstance(unwrapped, PeftModel):
             logger.warning(f"Model is not a PeftModel, falling back to full save.")
             self._save_full_model(
@@ -1220,7 +1328,7 @@ class BaseAdapter(ABC):
         save_directory: str,
         max_shard_size: str = "10GB",
         safe_serialization: bool = True,
-        dtype : Optional[Union[torch.dtype, str]] = None,
+        dtype: Optional[Union[torch.dtype, str]] = None,
     ) -> None:
         """
         **Modified from `Accelerator.save_model`**
@@ -1229,16 +1337,16 @@ class BaseAdapter(ABC):
         if os.path.isfile(save_directory):
             logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
-        
+
         # Normalize dtype
         if isinstance(dtype, str):
             dtype = {
-                'bfloat16': torch.bfloat16,
-                'float16': torch.float16,
-                'float32': torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
             }.get(dtype.lower(), torch.bfloat16)
 
-        unwrapped = self.accelerator.unwrap_model(model)
+        unwrapped = self._unwrap(model)
 
         # Check if casting is needed
         cast_needed = False
@@ -1250,20 +1358,16 @@ class BaseAdapter(ABC):
                     model_dtype = next(unwrapped.parameters()).dtype
                 except StopIteration:
                     # Empty model, assume no cast needed
-                    model_dtype = dtype 
-            
+                    model_dtype = dtype
+
             if model_dtype != dtype:
                 cast_needed = True
-        
+
         # Check offload
         is_offloaded = any(has_offloaded_params(module) for module in unwrapped.modules())
-        
+
         # No shard, no casting, no offload, save directyly
-        if (
-            not self._requires_collective_state_dict()
-            and not cast_needed
-            and not is_offloaded
-        ):
+        if not self._requires_collective_state_dict() and not cast_needed and not is_offloaded:
             # Standard save
             if self.accelerator.is_main_process:
                 unwrapped.save_pretrained(
@@ -1279,7 +1383,9 @@ class BaseAdapter(ABC):
             state_dict = get_state_dict_offloaded_model(model)
         else:
             if any(param.device == torch.device("meta") for param in model.parameters()):
-                raise RuntimeError("You can't save the model since some parameters are on the meta device.")
+                raise RuntimeError(
+                    "You can't save the model since some parameters are on the meta device."
+                )
             state_dict = self.get_state_dict(model, unwrap=True, ignore_frozen_params=False)
 
         # Case: DeepSpeed zero3 gets gathered and `state_dict` is empty
@@ -1289,7 +1395,7 @@ class BaseAdapter(ABC):
         # Dtype casting
         if dtype is not None:
             for k in state_dict.keys():
-                state_dict[k] = state_dict[k].to(device='cpu', dtype=dtype)
+                state_dict[k] = state_dict[k].to(device="cpu", dtype=dtype)
 
         os.makedirs(save_directory, exist_ok=True)
 
@@ -1297,7 +1403,11 @@ class BaseAdapter(ABC):
             state_dict = clean_state_dict_for_safetensors(state_dict)
 
         weights_name = SAFE_DIFFUSION_WEIGHTS_NAME if safe_serialization else DIFFUSION_WEIGHTS_NAME
-        filename_pattern = SAFE_DIFFUSION_WEIGHTS_PATTERN_NAME if safe_serialization else DIFFUSION_WEIGHTS_PATTERN_NAME
+        filename_pattern = (
+            SAFE_DIFFUSION_WEIGHTS_PATTERN_NAME
+            if safe_serialization
+            else DIFFUSION_WEIGHTS_PATTERN_NAME
+        )
 
         state_dict_split = split_torch_state_dict_into_shards(
             state_dict, filename_pattern=filename_pattern, max_shard_size=max_shard_size
@@ -1326,16 +1436,18 @@ class BaseAdapter(ABC):
         # Save the model
         for filename, tensors in state_dict_split.filename_to_tensors.items():
             shard = {tensor: state_dict[tensor] for tensor in tensors}
-            self.accelerator.save(shard, os.path.join(save_directory, filename), safe_serialization=safe_serialization)
+            self.accelerator.save(
+                shard, os.path.join(save_directory, filename), safe_serialization=safe_serialization
+            )
 
         # Save the config file
-        if hasattr(unwrapped, 'config') and unwrapped.config is not None:
+        if hasattr(unwrapped, "config") and unwrapped.config is not None:
             config_save_file = os.path.join(save_directory, CONFIG_NAME)
-            if hasattr(unwrapped.config, 'save_pretrained'):
+            if hasattr(unwrapped.config, "save_pretrained"):
                 unwrapped.config.save_pretrained(save_directory)
             else:
                 # Handle dict-like configs (e.g., FrozenDict from diffusers)
-                with open(config_save_file, 'w', encoding='utf-8') as f:
+                with open(config_save_file, "w", encoding="utf-8") as f:
                     json.dump(dict(unwrapped.config), f, indent=2, sort_keys=True)
 
             if self.accelerator.is_main_process:
@@ -1347,7 +1459,11 @@ class BaseAdapter(ABC):
                 "metadata": state_dict_split.metadata,
                 "weight_map": state_dict_split.tensor_to_filename,
             }
-            save_index_file = SAFE_DIFFUSION_WEIGHTS_INDEX_NAME if safe_serialization else DIFFUSION_WEIGHTS_INDEX_NAME
+            save_index_file = (
+                SAFE_DIFFUSION_WEIGHTS_INDEX_NAME
+                if safe_serialization
+                else DIFFUSION_WEIGHTS_INDEX_NAME
+            )
             save_index_file = os.path.join(save_directory, save_index_file)
             with open(save_index_file, "w", encoding="utf-8") as f:
                 content = json.dumps(index, indent=2, sort_keys=True) + "\n"
@@ -1369,7 +1485,7 @@ class BaseAdapter(ABC):
         max_shard_size: str = "10GB",
         dtype: Union[torch.dtype, str] = torch.bfloat16,
         save_ema: bool = True,
-        model_only : bool = True,
+        model_only: bool = True,
         safe_serialization: bool = True,
         **kwargs,
     ):
@@ -1379,18 +1495,20 @@ class BaseAdapter(ABC):
         # Normalize dtype
         if isinstance(dtype, str):
             dtype = {
-                'bfloat16': torch.bfloat16,
-                'float16': torch.float16,
-                'float32': torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
             }.get(dtype.lower(), torch.bfloat16)
-            
+
         # 1. Save the training state if not model_only
         if not model_only:
             if self.accelerator.is_main_process:
                 logger.info(f"Saving training state (resume-ready) to {save_directory}...")
-            
-            self.accelerator.save_state(save_directory, safe_serialization=safe_serialization, **kwargs)
-            
+
+            self.accelerator.save_state(
+                save_directory, safe_serialization=safe_serialization, **kwargs
+            )
+
             if self.accelerator.is_main_process:
                 logger.info(f"Training state saved.")
             return
@@ -1398,30 +1516,34 @@ class BaseAdapter(ABC):
         # 2. Save only model
         # Setup EMA context
         save_context = self.use_ema_parameters if save_ema else nullcontext
-        
+
         with save_context():
             for comp_name, target_modules in self.target_module_map.items():
                 if not hasattr(self, comp_name):
                     logger.warning(f"Component {comp_name} not found, skipping save")
                     continue
-                
+
                 if not target_modules:
                     logger.info(f"No target modules applied to {comp_name}, skip saving")
                     continue
 
-                component = self.get_component(comp_name)
-                
+                # Peel the RoutedComponentProxy to the inner module so the save
+                # path operates on the real diffusers/PeftModel (the prepared root
+                # is the ModelBundle; FSDP/DeepSpeed gathering happens inside
+                # get_state_dict on this member's params).
+                component = self._unwrap(self.get_component(comp_name))
+
                 # Determine save path
                 comp_path = (
-                    os.path.join(save_directory, comp_name) 
-                    if len(self.model_args.target_components) > 1 
+                    os.path.join(save_directory, comp_name)
+                    if len(self.model_args.target_components) > 1
                     else save_directory
                 )
-                
+
                 os.makedirs(comp_path, exist_ok=True)
-                
+
                 # Dispatch to appropriate save method
-                if self.model_args.finetune_type == 'lora':
+                if self.model_args.finetune_type == "lora":
                     if self.accelerator.is_main_process:
                         logger.info(f"Saving LoRA weights for {comp_name} to {comp_path}")
                     self._save_lora(component, comp_path)
@@ -1435,58 +1557,130 @@ class BaseAdapter(ABC):
                         safe_serialization=safe_serialization,
                         dtype=dtype,
                     )
-            
+
             # Sync after saving
             self.accelerator.wait_for_everyone()
-        
+
         if self.accelerator.is_main_process:
             logger.info(f"Checkpoint saved successfully to {save_directory}")
 
     # -------------------------------------------- Load -------------------------------------------
+    def _resolve_checkpoint_path(self, path: str) -> str:
+        """
+        Resolve `path` to a local directory, downloading from Hugging Face Hub when needed.
+
+        Resolution order:
+            1. If `path` starts with ``hf://``, strip the prefix and force HF download
+               (lets users override a colliding local directory).
+            2. Otherwise, if `path` exists locally, return it as-is.
+            3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
+               via Hugging Face Hub.
+
+        Multi-node-safe: all ranks call ``snapshot_download`` directly. Hugging
+        Face Hub's per-blob ``WeakFileLock`` serializes concurrent calls within
+        each filesystem domain (cross-node on POSIX-locking shared FS, per-node
+        on non-shared FS), so exactly one rank per filesystem domain actually
+        transfers bytes. Un-gated (rather than ``is_local_main_process`` plus a
+        barrier) so a failed download raises uniformly on every affected rank
+        instead of leaving siblings deadlocked at a barrier the failing rank
+        never reaches. Residual hazard: a rare single-rank transient failure
+        (e.g. one node's network blip) can produce asymmetric progress, in
+        which case the surviving ranks will eventually trip the NCCL watchdog
+        on the final barrier below.
+
+        Args:
+            path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
+
+        Returns:
+            Absolute local directory path ready for the existing checkpoint loaders.
+
+        Raises:
+            FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
+        """
+        # Normalize leading ``~`` for local-path inputs; no-op for HF specs since
+        # ``expanduser`` only acts on a leading ``~``.
+        path = os.path.expanduser(path)
+        force_hf = path.startswith(HF_PATH_PREFIX)
+
+        # Local path wins unless an explicit ``hf://`` prefix forces remote.
+        if not force_hf and os.path.exists(path):
+            return path
+
+        # ``parse_hf_checkpoint_path`` handles the ``hf://`` prefix internally.
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(path)
+
+        try:
+            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
+        except (RepositoryNotFoundError, HfHubHTTPError) as e:
+            raise FileNotFoundError(
+                f"Checkpoint {path!r} not found locally and could not be fetched "
+                f"from Hugging Face Hub (repo={repo_id!r}, subfolder={subfolder!r}, "
+                f"revision={revision!r}). For private repos, ensure HF_TOKEN is set "
+                f"on ALL nodes."
+            ) from e
+
+        # Sync after download so downstream loaders enter the lockstep dispatch
+        # together. On symmetric failure every rank raises above before this
+        # barrier is reached, so no deadlock; the residual asymmetric-failure
+        # case is documented in the docstring.
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_local_main_process:
+            logger.info(
+                f"[local rank 0 / global rank {self.accelerator.process_index}] "
+                f"resolved checkpoint '{path}' -> {local_path}"
+            )
+
+        return local_path
+
     @staticmethod
     def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:
         """Load sharded safetensors checkpoint."""
-        with open(index_file, 'r') as f:
+        with open(index_file, "r") as f:
             index = json.load(f)
-        
+
         state_dict = {}
         loaded_files = set()
-        
+
         for param_name, filename in index["weight_map"].items():
             if filename not in loaded_files:
                 shard_path = os.path.join(checkpoint_dir, filename)
                 shard = load_file(shard_path)
                 state_dict.update(shard)
                 loaded_files.add(filename)
-        
+
         return state_dict
 
     def _load_lora(self, path: str) -> None:
         """Load LoRA adapters for target components with auto-format detection."""
-        for comp_name in self.model_args.target_components:
+        # Iterate only components that actually carry target modules. Frozen
+        # bundled members (e.g. Wan2.2's `transformer_2`, kept in
+        # `target_components` solely to be FSDP-sharded for memory) map to None
+        # in `target_module_map` and are skipped by `save_checkpoint`; iterating
+        # `target_components` here would instead look for a `.../transformer_2/`
+        # subdir that was never written and log a spurious error on every resume.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
-            
+
             component = self.get_component(comp_name)
             comp_path = (
-                os.path.join(path, comp_name) 
-                if len(self.model_args.target_components) > 1 
+                os.path.join(path, comp_name)
+                if len(self.model_args.target_components) > 1
                 else path
             )
-            
-            unwrapped = self.accelerator.unwrap_model(component)
-            
+
+            unwrapped = self._unwrap(component)
+
             # Auto-detect checkpoint format
             adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
             has_config_file = os.path.exists(adapter_config_path)
-            
+
             if has_config_file:
                 # Standard PeftModel format
                 if not isinstance(unwrapped, PeftModel):
-                    unwrapped = PeftModel.from_pretrained(
-                        unwrapped, comp_path, is_trainable=True
-                    )
+                    unwrapped = PeftModel.from_pretrained(unwrapped, comp_path, is_trainable=True)
                     unwrapped.set_adapter("default")
                     self.set_component(comp_name, unwrapped)
                 else:
@@ -1502,35 +1696,37 @@ class BaseAdapter(ABC):
                     bin_files = glob.glob(os.path.join(comp_path, "*.bin"))
                     if bin_files:
                         state_dict_path = sorted(bin_files)[0]
-                        state_dict = torch.load(state_dict_path, map_location='cpu')
+                        state_dict = torch.load(state_dict_path, map_location="cpu")
                     else:
-                        logger.error(f"No checkpoint file (.safetensors or .bin) found at {comp_path}")
+                        logger.error(
+                            f"No checkpoint file (.safetensors or .bin) found at {comp_path}"
+                        )
                         continue
-                
+
                 if self.accelerator.is_main_process:
                     logger.info(
                         f"Loaded LoRA `state_dict` from: {state_dict_path}. "
                         f"If this is not wanted, please make sure the directory contains only single checkpoint file. "
                     )
-                
+
                 # Apply key mapping for legacy format
                 state_dict = mapping_lora_state_dict(state_dict)
-                
+
                 # Infer LoRA configuration from state_dict
                 lora_rank, lora_alpha = infer_lora_config(state_dict)
-                lora_alpha = self.model_args.lora_alpha or lora_alpha # Use model arg if given
-                if self.model_args.target_modules in [None, 'default']:
+                lora_alpha = self.model_args.lora_alpha or lora_alpha  # Use model arg if given
+                if self.model_args.target_modules in [None, "default"]:
                     # If default, infer target modules
                     target_modules = infer_target_modules(state_dict)
                 else:
                     target_modules = self.model_args.target_modules
-                
+
                 if self.accelerator.is_main_process:
                     logger.info(
                         f"Inferred LoRA config for {comp_name}: "
                         f"rank={lora_rank}, alpha={lora_alpha}, target_modules={target_modules[:5]}..."
                     )
-                
+
                 # Create PeftModel if not already
                 if not isinstance(unwrapped, PeftModel):
                     lora_config = LoraConfig(
@@ -1539,44 +1735,47 @@ class BaseAdapter(ABC):
                         init_lora_weights="gaussian",
                         target_modules=target_modules,
                     )
-                    
+
                     unwrapped = get_peft_model(unwrapped, lora_config)
                     unwrapped.set_adapter("default")
-                
+
                 # Load mapped state_dict
                 missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
 
                 # Filter missing keys to LoRA only
                 missing = [k for k in missing if any(lk in k for lk in self.lora_keys)]
-                
+
                 if self.accelerator.is_main_process:
                     if missing:
                         logger.warning(f"Missing keys: {missing[:5]}...")
                     if unexpected:
                         logger.warning(f"Unexpected keys: {unexpected[:5]}...")
-                
+
                 self.set_component(comp_name, unwrapped)
-            
+
             if self.accelerator.is_main_process:
                 logger.info(f"LoRA adapter loaded for {comp_name} from {comp_path}")
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
         """Load full model weights for target components."""
-        for comp_name in self.model_args.target_components:
+        # Match `save_checkpoint`: only components with target modules are
+        # written, so frozen bundled members (`target_module_map[name] is None`)
+        # must be skipped here rather than iterating all `target_components`.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
-            
+
             component = self.get_component(comp_name)
             comp_path = (
-                os.path.join(path, comp_name) 
-                if len(self.model_args.target_components) > 1 
+                os.path.join(path, comp_name)
+                if len(self.model_args.target_components) > 1
                 else path
             )
-            
-            unwrapped = self.accelerator.unwrap_model(component)
+
+            unwrapped = self._unwrap(component)
             component_class = unwrapped.__class__
-        
+
             # Try from_pretrained first
             try:
                 new_component = component_class.from_pretrained(comp_path)
@@ -1586,7 +1785,9 @@ class BaseAdapter(ABC):
                 continue
             except Exception as e:
                 if self.accelerator.is_main_process:
-                    logger.debug(f"from_pretrained failed for {comp_name}: {e}, trying manual load...")
+                    logger.debug(
+                        f"from_pretrained failed for {comp_name}: {e}, trying manual load..."
+                    )
 
             # Detect the checkpoint type
             index_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_INDEX_NAME)
@@ -1599,10 +1800,10 @@ class BaseAdapter(ABC):
             else:
                 logger.error(f"No valid checkpoint found for {comp_name} at {comp_path}")
                 continue
-            
+
             # Load state_dict
             missing, unexpected = unwrapped.load_state_dict(state_dict, strict=strict)
-            
+
             if self.accelerator.is_main_process:
                 if missing:
                     logger.warning(f"Missing keys for {comp_name}: {missing[:5]}...")
@@ -1614,53 +1815,96 @@ class BaseAdapter(ABC):
         """Load full training state for resuming training."""
         if self.accelerator.is_main_process:
             logger.info(f"Loading training state from {path}...")
-        
+
         self.accelerator.load_state(path)
-        
+
         if self.accelerator.is_main_process:
             logger.info("Training state loaded successfully.")
+
+    def _detect_checkpoint_type(self, path: str) -> Literal["lora", "full"]:
+        """
+        Auto-detect checkpoint format by inspecting directory contents.
+
+        Checks whether the checkpoint directory (or component subdirectories)
+        contains LoRA adapter files (adapter_config.json). Falls back to 'full'
+        if no LoRA signature files are found.
+        """
+        paths_to_check = (
+            [os.path.join(path, comp_name) for comp_name in self.model_args.target_components]
+            if len(self.model_args.target_components) > 1
+            else [path]
+        )
+        for check_path in paths_to_check:
+            if os.path.exists(os.path.join(check_path, LORA_ADAPTER_CONFIG_NAME)):
+                if self.accelerator.is_main_process:
+                    logger.info(f"Auto-detected LoRA checkpoint at {check_path}")
+                return "lora"
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Auto-detected full model checkpoint at {path}")
+        return "full"
 
     def load_checkpoint(
         self,
         path: str,
         strict: bool = True,
-        resume_type: Optional[Literal['lora', 'full', 'state']] = None,
+        resume_type: Optional[Literal["lora", "full", "state"]] = None,
     ) -> None:
         """
         Load checkpoint for target components.
-        
+
         Args:
-            path: Checkpoint directory path
-            model_only: If True, load only model weights. If False, load full training state
-                        (model, optimizer, scheduler, RNG states) for resuming training.
+            path: Checkpoint directory path.
             strict: Whether to strictly enforce state_dict key matching (only for full model).
             resume_type: Type of checkpoint to load.
                 - 'lora': Load LoRA adapters only
-                - 'full': Load full model weights  
-                - 'state': Load full training state (model + optimizer + scheduler + RNG)
-                - None: Auto-detect based on finetune_type
+                - 'full': Load full model weights
+                - 'state': Load full training state (model + optimizer + RNG)
+                - None: Auto-detect based on checkpoint directory contents
         """
-        path = os.path.expanduser(path)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path not found: {path}")
-        
+        path = self._resolve_checkpoint_path(path)
+
         # Auto-detect if not specified
         if resume_type is None:
-            resume_type = self.model_args.finetune_type  # 'lora' or 'full'
-        
-        if resume_type == 'state':
+            resume_type = self._detect_checkpoint_type(path)
+
+        if resume_type == "state":
             self._load_training_state(path)
-        elif resume_type == 'lora':
+        elif resume_type == "lora":
             self._load_lora(path)
-        elif resume_type == 'full':
+        elif resume_type == "full":
             self._load_full_model(path, strict=strict)
         else:
-            raise ValueError(f"Invalid resume_type: {resume_type}. Available: ['lora', 'full', 'state'].")
-        
+            raise ValueError(
+                f"Invalid resume_type: {resume_type}. Available: ['lora', 'full', 'state']."
+            )
+
         self.accelerator.wait_for_everyone()
-        
+
         if self.accelerator.is_main_process:
             logger.info(f"Checkpoint loaded successfully from {path} (type={resume_type})")
+
+    def _merge_lora_if_needed(self) -> None:
+        """
+        Merge LoRA adapters into base model weights when transitioning from
+        LoRA checkpoint to full fine-tuning.
+
+        Ensures the model is a plain nn.Module (not PeftModel) before entering
+        the full training pipeline. The LoRA weights are permanently fused into
+        the base model via merge_and_unload().
+        """
+        for comp_name in self.model_args.target_components:
+            component = self.get_component(comp_name)
+            unwrapped = self._unwrap(component)
+
+            if isinstance(unwrapped, PeftModel):
+                merged = unwrapped.merge_and_unload()
+                self.set_component(comp_name, merged)
+                if hasattr(self.pipeline, comp_name):
+                    setattr(self.pipeline, comp_name, merged)
+
+                if self.accelerator.is_main_process:
+                    logger.info(f"Merged LoRA adapter into base model for {comp_name}")
 
     # ============================== Freezing Components ==============================
     def _freeze_text_encoders(self):
@@ -1670,9 +1914,12 @@ class BaseAdapter(ABC):
             encoder.eval()
 
     def _freeze_vae(self):
-        """Freeze VAE."""
+        """Freeze video VAE and audio VAE (if present)."""
         self.vae.requires_grad_(False)
         self.vae.eval()
+        if self.audio_vae is not None:
+            self.audio_vae.requires_grad_(False)
+            self.audio_vae.eval()
 
     def _freeze_transformers(self):
         """Freeze transformer components (e.g., UNet, ControlNets)."""
@@ -1688,59 +1935,60 @@ class BaseAdapter(ABC):
         self._freeze_text_encoders()
         self._freeze_vae()
         self._freeze_transformers()
-        
+
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping freeze")
                 continue
-            
+
             trainable_modules = self.target_module_map.get(comp_name)
-            
-            if self.model_args.finetune_type == 'lora':
+
+            if self.model_args.finetune_type == "lora":
                 trainable_modules = None
-            
+
             self._freeze_component(comp_name, trainable_modules=trainable_modules)
-            
+
             # Restore train mode for components that have trainable parameters
             if trainable_modules:
                 component = self.get_component(comp_name)
                 component.train()
 
-    def _freeze_component(self, component_name: str, trainable_modules: Optional[Union[str, List[str]]] = None):
+    def _freeze_component(
+        self, component_name: str, trainable_modules: Optional[Union[str, List[str]]] = None
+    ):
         """Freeze a specific component with optional selective unfreezing."""
         component = self.get_component(component_name)
-        
-        if trainable_modules == 'all':
+
+        if trainable_modules == "all":
             logger.info(f"Unfreezing ALL {component_name} parameters")
             component.requires_grad_(True)
             return
-        
+
         if isinstance(trainable_modules, str):
-            if trainable_modules == 'default':
+            if trainable_modules == "default":
                 trainable_modules = self.default_target_modules
             else:
                 trainable_modules = [trainable_modules]
 
         # Freeze all first
         component.requires_grad_(False)
-        
+
         if not trainable_modules:
             logger.info(f"Froze ALL {component_name} parameters")
             return
-        
+
         # Selectively unfreeze
         trainable_count = 0
         for name, param in component.named_parameters():
             if any(target in name for target in trainable_modules):
                 param.requires_grad = True
                 trainable_count += 1
-        
+
         if trainable_count == 0:
             logger.warning(f"No parameters in {component_name} matched: {trainable_modules}")
         else:
             logger.info(f"Unfroze {trainable_count} parameters in {component_name}")
-
 
     # ============================== Trainable Parameters ==============================
     def get_trainable_parameters(self) -> List[torch.nn.Parameter]:
@@ -1752,13 +2000,10 @@ class BaseAdapter(ABC):
                 params.extend(filter(lambda p: p.requires_grad, component.parameters()))
         return params
 
-    def get_optimizer_param_groups(self) -> List[Union[torch.nn.Parameter, Dict[str, Any]]]:
-        """
-        返回优化器参数配置。
-
-        默认直接返回可训练参数列表；子类可覆盖为 param groups 形式，
-        例如 ``[{\"params\": [...], \"lr\": ...}, ...]``。
-        """
+    def get_optimizer_param_groups(
+        self,
+    ) -> List[Union[torch.nn.Parameter, Dict[str, Any]]]:
+        """Return optimizer parameters or adapter-specific parameter groups."""
         return self.get_trainable_parameters()
 
     def log_trainable_parameters(self):
@@ -1766,28 +2011,28 @@ class BaseAdapter(ABC):
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
                 continue
-            
+
             component = self.get_component(comp_name)
             total_params = 0
             trainable_params = 0
             total_size_bytes = 0
             trainable_size_bytes = 0
-            
+
             for param in component.parameters():
                 param_count = param.numel()
                 param_size = param.element_size() * param_count
-                
+
                 total_params += param_count
                 total_size_bytes += param_size
-                
+
                 if param.requires_grad:
                     trainable_params += param_count
                     trainable_size_bytes += param_size
-            
-            total_size_gb = total_size_bytes / (1024 ** 3)
-            trainable_size_gb = trainable_size_bytes / (1024 ** 3)
+
+            total_size_gb = total_size_bytes / (1024**3)
+            trainable_size_gb = trainable_size_bytes / (1024**3)
             trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
-            
+
             logger.info("=" * 70)
             logger.info(f"{comp_name.capitalize()} Trainable Parameters:")
             logger.info(f"  Total:      {total_params:>15,d} ({total_size_gb:>6.2f} GB)")
@@ -1803,30 +2048,36 @@ class BaseAdapter(ABC):
         Prepared (FSDP/DeepSpeed wrapped) components are managed by the
         accelerator and should not be manually moved.
         """
-        return name not in self._prepared_components
+        return name not in self._components
 
-    def _resolve_component_names(self, components: Optional[Union[str, List[str]]] = None) -> List[str]:
+    def _resolve_component_names(
+        self, components: Optional[Union[str, List[str]]] = None
+    ) -> List[str]:
         """
         Resolve component specifiers into concrete pipeline attribute names. `None` means all components.
-        
+
         Handles group names ('text_encoders', 'transformers') by expanding them,
         and passes through concrete names ('text_encoder', 'vae', 'transformer_2') as-is.
         """
         if components is None:
-            return self.text_encoder_names + ['vae'] + self.transformer_names
-        
+            return [
+                name
+                for name, comp in self.pipeline.components.items()
+                if isinstance(comp, torch.nn.Module)
+            ]
+
         if isinstance(components, str):
             components = [components]
-        
+
         resolved = []
         for comp in components:
-            if comp == 'text_encoders':
+            if comp == "text_encoders":
                 resolved.extend(self.text_encoder_names)
-            elif comp == 'transformers':
+            elif comp == "transformers":
                 resolved.extend(self.transformer_names)
             else:
                 resolved.append(comp)
-        
+
         # Deduplicate preserving order
         return list(dict.fromkeys(resolved))
 
@@ -1837,7 +2088,7 @@ class BaseAdapter(ABC):
     ):
         """
         Load specified components to device, skipping prepared (accelerator-managed) ones.
-        
+
         Args:
             components: Component name(s) or group names ('text_encoders', 'transformers').
                         None loads all components.
@@ -1845,32 +2096,32 @@ class BaseAdapter(ABC):
         """
         device = device or self.device
         names = self._resolve_component_names(components)
-        
+
         for name in names:
             # Skip components that are managed by the accelerator
             if not self._should_manage_device(name):
                 continue
             component = self.get_component(name)
-            if component is not None and hasattr(component, 'to'):
+            if component is not None and hasattr(component, "to"):
                 component.to(device)
 
     def off_load_components(self, components: Optional[Union[str, List[str]]] = None):
         """
         Off-load specified components to CPU, skipping prepared (accelerator-managed) ones.
-        
+
         Args:
             components: Component name(s) or group names ('text_encoders', 'transformers').
                         None off-loads all components.
         """
         names = self._resolve_component_names(components)
-        
+
         for name in names:
             # Skip components that are managed by the accelerator
             if not self._should_manage_device(name):
                 continue
             component = self.get_component(name)
-            if component is not None and hasattr(component, 'to'):
-                component.to('cpu')
+            if component is not None and hasattr(component, "to"):
+                component.to("cpu")
 
     def on_load(self, device: Optional[Union[torch.device, str]] = None):
         """Load all components to device."""
@@ -1882,60 +2133,62 @@ class BaseAdapter(ABC):
 
     # Keep convenience aliases for backward compat, all delegate to unified methods
     def on_load_text_encoders(self, device: Optional[Union[torch.device, str]] = None):
-        self.on_load_components('text_encoders', device)
+        self.on_load_components("text_encoders", device)
 
     def off_load_text_encoders(self):
-        self.off_load_components('text_encoders')
+        self.off_load_components("text_encoders")
 
     def on_load_vae(self, device: Optional[Union[torch.device, str]] = None):
-        self.on_load_components('vae', device)
+        self.on_load_components("vae", device)
 
     def off_load_vae(self):
-        self.off_load_components('vae')
+        self.off_load_components("vae")
 
     def on_load_transformers(self, device: Optional[Union[torch.device, str]] = None):
-        self.on_load_components('transformers', device)
+        self.on_load_components("transformers", device)
 
     def off_load_transformers(self):
-        self.off_load_components('transformers')
-
+        self.off_load_components("transformers")
 
     # ============================== Preprocessing ==============================
     def preprocess_func(
         self,
-        prompt : Optional[List[str]] = None,
-        images : Optional[List[Union[Image.Image, List[Image.Image]]]] = None,
-        videos : Optional[List[Union[List[Image.Image], List[List[Image.Image]]]]] = None,
+        prompt: Optional[List[str]] = None,
+        images: Optional[List[Union[Image.Image, List[Image.Image]]]] = None,
+        videos: Optional[List[Union[List[Image.Image], List[List[Image.Image]]]]] = None,
+        audios: Optional[List[Union[torch.Tensor, List[torch.Tensor]]]] = None,
         **kwargs,
     ) -> Dict[str, Union[List[Any], torch.Tensor]]:
         """
-        Preprocess input prompt, image, and video into model-compatible embeddings/tensors.
+        Preprocess input prompt, image, video, and audio into model-compatible embeddings/tensors.
         Always process a batch of inputs.
         Args:
             prompt: List of text prompts. A batch of text inputs.
-            images: 
+            images:
                 - None: no image input.
                 - List[Image.Image]: list of images (a batch of single images)
                 - List[List[Image.Image]]: list of list of images (a batch of a list images, each image list can be empty)
-            videos: 
+            videos:
                 - None: no video input.
                 - List[Video]: list of videos (a batch of single videos)
                 - List[List[Video]]: list of list of videos (a batch of a list videos, each video list can be empty)
+            audios:
+                - None: no audio input.
+                - List[torch.Tensor]: list of audio waveforms (a batch of single audios)
+                - List[List[torch.Tensor]]: list of list of audio waveforms (a batch of a list audios, each audio list can be empty)
             **kwargs: Additional keyword arguments for encoder methods.
 
         """
         results = {}
-        
+
         for input, encoder_method in [
             (prompt, self.encode_prompt),
             (images, self.encode_image),
             (videos, self.encode_video),
+            (audios, self.encode_audio),
         ]:
             if input is not None:
-                res = encoder_method(
-                        input,
-                        **(filter_kwargs(encoder_method, **kwargs))
-                    )
+                res = encoder_method(input, **(filter_kwargs(encoder_method, **kwargs)))
 
                 if res is None:
                     # No preprocess needed
@@ -1949,71 +2202,115 @@ class BaseAdapter(ABC):
                     results.update(res)
                 else:
                     raise ValueError(
-                        f"Encoder method {encoder_method.__name__} should return a non-empty dict and each key maps to a list or tensor, " 
+                        f"Encoder method {encoder_method.__name__} should return a non-empty dict and each key maps to a list or tensor, "
                         f"but got {type(res)} with values types {[type(v) for v in res.values()]}"
                     )
 
         return results
 
-    @abstractmethod
     def encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: List[str],
         **kwargs,
-    ) -> Dict[str, Union[List[Any], torch.Tensor]]:
-        """
-        Tokenizes input text prompts into model-compatible embeddings/tensors.
+    ) -> Optional[Dict[str, Union[List[Any], torch.Tensor]]]:
+        """Encode a batch of text prompts into model-compatible embeddings.
+
+        Default implementation is a no-op (returns ``None``). Subclasses
+        override this when the model needs text conditioning.
+        ``preprocess_func`` skips integration when the return value is
+        ``None``, so adapters that don't need text encoding can simply
+        inherit this default.
+
         Args:
-            prompt: Single or a batch of text prompts.
-            **kwargs: Additional keyword arguments for tokenization/encoding.
+            prompt: Batch of text prompts produced by
+                ``dataset.py._preprocess_batch``.
+            **kwargs: Adapter-specific encoding kwargs.
+
+        Returns:
+            Mapping from output key to encoded tensor/list, or ``None`` when
+            the adapter does not perform prompt encoding.
         """
         pass
 
-    @abstractmethod
     def encode_image(
         self,
-        images : Union[Image.Image, List[Image.Image], List[List[Image.Image]]],
+        images: MultiImageBatch,
         **kwargs,
-    ) -> Dict[str, Union[List[Any], torch.Tensor]]:
-        """
-        Encodes input images into latent representations if applicable.
-        Args:
-            images:
-                - Single Image.Image
-                - List[Image.Image]: list of images (a batch of single images)
-                - List[List[Image.Image]]: list of list of images (a batch of multiple condition images)
+    ) -> Optional[Dict[str, Union[List[Any], torch.Tensor]]]:
+        """Encode a batch of (multi-)image inputs into latent representations.
 
-        NOTE:
-            The determination of input `images` type is based on:
-                - if isinstance(images, Image.Image): single image
-                - elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images): list of single images
-                - elif isinstance(images, list) and all(isinstance(imgs, list) for imgs in images): list of list of images
-            This function should return a dict containing the encoded representations,
-                especially, the key `condition_images` should map to the processed PIL images, i.e., a batch of (list of) PIL images.
+        Default implementation is a no-op (returns ``None``). Subclasses
+        override this when the model uses image conditioning.
+        ``preprocess_func`` skips integration when the return value is
+        ``None``, so adapters that don't need image encoding can simply
+        inherit this default.
+
+        Args:
+            images: ``MultiImageBatch`` produced by
+                ``dataset.py._preprocess_batch`` — a ``List[ImageBatch]``
+                (ragged) or a uniform-shape tensor/array. Each batch slot
+                is itself a list of images (``[]`` for empty samples).
+            **kwargs: Adapter-specific encoding kwargs.
+
+        Returns:
+            Mapping from output key to encoded tensor/list (e.g.,
+            ``condition_images``), or ``None`` when the adapter does not
+            perform image encoding.
         """
         pass
 
-    @abstractmethod
     def encode_video(
         self,
-        videos: Union[List[Image.Image], List[List[Image.Image]], List[List[List[Image.Image]]]],
+        videos: MultiVideoBatch,
         **kwargs,
-    ) -> Dict[str, Union[List[Any], torch.Tensor]]:
-        """
-        Encodes input videos into latent representations if applicable.
-        Args:
-            videos:
-                - List[Image.Image]: Single video input
-                - List[List[Image.Image]]: list of videos (A batch of videos)
-                - List[List[List[Image.Image]]]: list of list of videos (A batch of multiple condition videos)
-        NOTE:
-            The determination of input `videos` type should be based on:
-                - if isinstance(videos, list) and all(isinstance(frame, Image.Image) for frame in videos): single video
-                - elif isinstance(videos, list) and all(isinstance(frames, list) for frames in videos): list of videos
-                - elif isinstance(videos, list) and all(isinstance(videos_list, list) for videos_list in videos): list of list of videos
+    ) -> Optional[Dict[str, Union[List[Any], torch.Tensor]]]:
+        """Encode a batch of (multi-)video inputs into latent representations.
 
-            This function should return a dict containing the encoded representations,
-            especially, the key `condition_videos` should map to the processed video frames, i.e., a batch of (list of) list of PIL images.
+        Default implementation is a no-op (returns ``None``). Subclasses
+        override this when the model uses video conditioning.
+        ``preprocess_func`` skips integration when the return value is
+        ``None``, so adapters that don't need video encoding can simply
+        inherit this default.
+
+        Args:
+            videos: ``MultiVideoBatch`` produced by
+                ``dataset.py._preprocess_batch`` — a ``List[VideoBatch]``
+                (ragged) or a uniform-shape tensor/array. Each batch slot
+                is itself a list of videos (``[]`` for empty samples).
+            **kwargs: Adapter-specific encoding kwargs.
+
+        Returns:
+            Mapping from output key to encoded tensor/list (e.g.,
+            ``condition_videos``), or ``None`` when the adapter does not
+            perform video encoding.
+        """
+        pass
+
+    def encode_audio(
+        self,
+        audios: MultiAudioBatch,
+        **kwargs,
+    ) -> Optional[Dict[str, Union[List[Any], torch.Tensor]]]:
+        """Encode a batch of (multi-)audio inputs into latent representations.
+
+        Default implementation is a no-op (returns ``None``). Subclasses
+        override this when the model uses audio conditioning.
+        ``preprocess_func`` skips integration when the return value is
+        ``None``, so adapters that don't need audio encoding can simply
+        inherit this default.
+
+        Args:
+            audios: ``MultiAudioBatch`` produced by
+                ``dataset.py._preprocess_batch`` — a ``List[AudioBatch]``
+                (ragged) or a uniform-shape tensor/array. Each batch slot
+                is itself a list of audio waveforms (``[]`` for empty
+                samples).
+            **kwargs: Adapter-specific encoding kwargs.
+
+        Returns:
+            Mapping from output key to encoded tensor/list (e.g.,
+            ``condition_audios``), or ``None`` when the adapter does not
+            perform audio encoding.
         """
         pass
 
@@ -2028,6 +2325,23 @@ class BaseAdapter(ABC):
         Decodes latent representations back into images/videos if applicable.
         """
         pass
+
+    # ======================================= Latent Geometry =======================================
+    def resolve_latent_axes(self, latents: torch.Tensor) -> LatentAxes:
+        """Resolve the :class:`LatentAxes` (axis roles) for ``latents``.
+
+        Returns the adapter's static ``LATENT_AXES`` override when set, otherwise
+        infers from the latent ndim (3=packed, 4=conv, 5=video). Resolution-invariant.
+
+        Args:
+            latents: A batched latent tensor.
+
+        Returns:
+            The :class:`LatentAxes` describing ``latents``.
+        """
+        if self.LATENT_AXES is not None:
+            return self.LATENT_AXES
+        return infer_latent_axes(latents.ndim)
 
     # ======================================= Sampling & Training =======================================
     @abstractmethod

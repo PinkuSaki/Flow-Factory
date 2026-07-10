@@ -77,7 +77,7 @@ This mirrors the reference training layout from `sd-scripts` closely enough for 
 The Anima examples are configured to prefer BF16 end to end:
 
 - Top-level `mixed_precision: "bf16"`
-- `model.master_weight_dtype: "bf16"`
+- `model.trainable_parameters_dtype: "bf16"`
 - `train.latent_storage_dtype: "bf16"`
 
 The `latent_storage_dtype` override matters for Anima because the rollout path stores trajectory latents between sampling and optimization. Using BF16 avoids unintentional downcasts during BF16 training and inference.
@@ -86,16 +86,18 @@ The `latent_storage_dtype` override matters for Anima because the rollout path s
 
 Updated example files:
 
-- `examples/grpo/lora/anima.yaml`
-- `examples/grpo/full/anima.yaml`
-- `examples/nft/lora/anima.yaml`
-- `examples/awm/lora/anima.yaml`
-- `examples/grpo/lora/anima_anime_custom.yaml`
+- `examples/grpo/lora/anima/default.yaml`
+- `examples/grpo/full/anima/default.yaml`
+- `examples/nft/lora/anima/default.yaml`
+- `examples/awm/lora/anima/default.yaml`
+- `examples/awm/lora/anima/single_gpu_smoke.yaml`
+- `examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml`
+- `examples/grpo/lora/anima/anime_custom.yaml`
 
 Notable changes:
 
 - `mixed_precision` switched from FP16 to BF16
-- `master_weight_dtype` switched from FP16 to BF16
+- `trainable_parameters_dtype` switched from FP16 to BF16
 - `sd_scripts_root` set to `~/sd-scripts`
 - `train.latent_storage_dtype` set to `bf16`
 - Full finetune example now uses `target_modules: "all"`
@@ -107,7 +109,7 @@ The current custom anime scaling route is documented in `anima_scaling_plan.md`.
 
 Primary runtime config:
 
-- `examples/awm/lora/anima.yaml`
+- `examples/awm/lora/anima/default.yaml`
 
 Dataset split:
 
@@ -127,7 +129,7 @@ Reward stack:
 Operational notes:
 
 - The WD cache does not need to be rebuilt after the train/test split because it covers all source prompts.
-- `examples/awm/lora/anima.yaml` currently omits `train.max_epochs`; this means training runs until interrupted. Set a finite value before unattended formal runs.
+- `examples/awm/lora/anima/default.yaml` currently omits `train.max_epochs`; this means training runs until interrupted. Set a finite value before unattended formal runs.
 
 ## Reproducible Smoke Runner
 
@@ -172,7 +174,7 @@ Date: April 11, 2026
 
 Validated:
 
-- `Arguments.load_from_yaml("examples/grpo/lora/anima.yaml")`
+- `Arguments.load_from_yaml("examples/grpo/lora/anima/default.yaml")`
 - `load_model(...)` successfully returns `AnimaAdapter`
 - LoRA attaches to the expected default target modules
 
@@ -250,7 +252,7 @@ This confirms that the LoRA training path is not only executable, but also updat
 
 Date: April 11, 2026
 
-Validated with `examples/grpo/full/anima.yaml`:
+Validated with `examples/grpo/full/anima/default.yaml`:
 
 - adapter instantiation succeeds
 - all transformer parameters are unfrozen
@@ -331,7 +333,7 @@ Date: April 26, 2026
 Validated with:
 
 - `python scripts/validate_anima_lora_smoke.py --scenario grpo-sageattn`
-- base config: `examples/grpo/lora/anima.yaml`
+- base config: `examples/grpo/lora/anima/default.yaml`
 - runtime overrides:
   - `attn_mode=sageattn`
   - `split_attn=false`
@@ -365,7 +367,7 @@ Date: April 26, 2026
 Validated with:
 
 - `python scripts/validate_anima_lora_smoke.py --scenario nft`
-- base config: `examples/nft/lora/anima.yaml`
+- base config: `examples/nft/lora/anima/default.yaml`
 - runtime overrides:
   - dataset limited to 1 prompt
   - `group_size=2`
@@ -398,7 +400,7 @@ Date: April 26, 2026
 Validated with:
 
 - `python scripts/validate_anima_lora_smoke.py --scenario awm`
-- base config: `examples/awm/lora/anima.yaml`
+- base config: `examples/awm/lora/anima/default.yaml`
 - runtime overrides:
   - dataset limited to 1 prompt
   - `group_size=2`
@@ -445,7 +447,7 @@ Validated local CPU-mode reward services:
   - `/compute` with a prompt from the split dataset and a dummy image: returned one finite reward, `0.042261261492967606`
   - `/offload`: success
 
-This confirms that the two local reward servers can load, score, and offload using the same endpoints configured in `examples/awm/lora/anima.yaml`.
+This confirms that the two local reward servers can load, score, and offload using the same endpoints configured in `examples/awm/lora/anima/default.yaml`.
 
 ### 11. AWM real remote-reward training-flow smoke
 
@@ -453,7 +455,7 @@ Date: April 26, 2026
 
 Validated with:
 
-- base config: `examples/awm/lora/anima.yaml`
+- base config: `examples/awm/lora/anima/default.yaml`
 - runtime overrides:
   - dataset limited to 1 prompt from `dataset/anime_custom_single_gpu_eval16`
   - `group_size=2`
@@ -519,6 +521,37 @@ Validated:
 - train/test union matches the source record set
 - `GeneralDataset(..., split="train", enable_preprocess=False)` loads `4033` records
 - `GeneralDataset(..., split="test", enable_preprocess=False)` loads `16` records
+
+### 14. Upstream merge AWM smoke and multi-GPU preparation
+
+Date: July 11, 2026
+
+Validated on one NVIDIA RTX 4080 SUPER with:
+
+- `ff-train examples/awm/lora/anima/single_gpu_smoke.yaml`
+- Anima base, Qwen3, and Qwen-Image VAE checkpoints loaded from local safetensors
+- Aesthetic Shadow served on CPU at `http://127.0.0.1:18081`
+- one evaluation prompt plus `group_size=2` training samples at `resolution=256`
+- two inference steps and one AWM training timestep
+
+Observed results:
+
+- generated sample count: `2`
+- evaluation sample count: `1`
+- evaluation Aesthetic Shadow reward: `0.5181`
+- Aesthetic Shadow reward mean/std: `0.2570 / 0.1662`
+- advantage range: `[-1, 1]`
+- ratio min/max/mean: `1.0 / 1.0 / 1.0`
+- logged grad norm: `0.0225`
+- optimizer steps completed: `1`
+- process exit code: `0`
+
+The follow-up config is `examples/awm/lora/anima/multi_gpu_fsdp2_smoke.yaml`.
+It resolves to four processes, `group_contiguous` sampling, two local batches per
+rank, and two gradient-accumulation steps. The adapter now exposes Anima `Block`
+and `LLMAdapterTransformerBlock` as FSDP no-split module classes so Accelerate can
+wrap repeated blocks rather than the whole transformer as one unit. The multi-GPU
+run remains pending because this host has one GPU.
 
 ## Notes and Current Limits
 

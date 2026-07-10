@@ -34,7 +34,7 @@ all `4049` source prompts:
 
 Primary config:
 
-- `examples/awm/lora/anima.yaml`
+- `examples/awm/lora/anima/default.yaml`
 
 Current important settings:
 
@@ -57,7 +57,7 @@ Current important settings:
 
 Important operational note:
 
-- `examples/awm/lora/anima.yaml` currently omits `train.max_epochs`.
+- `examples/awm/lora/anima/default.yaml` currently omits `train.max_epochs`.
 - `max_epochs=None` means the trainer runs until interrupted.
 - Set an explicit finite `max_epochs` before unattended formal runs.
 
@@ -164,7 +164,7 @@ Results:
 
 ### AWM Remote-Reward End-to-End Smoke
 
-The tiny AWM run loaded `examples/awm/lora/anima.yaml`, replaced only runtime
+The tiny AWM run loaded `examples/awm/lora/anima/default.yaml`, replaced only runtime
 scale fields, generated `2` images at `64x64`, computed both real remote rewards,
 and completed one optimizer step.
 
@@ -197,7 +197,7 @@ compatibility; they are not capacity limits for the target GPU.
 
 ## Next Steps
 
-1. Add a finite `train.max_epochs` to `examples/awm/lora/anima.yaml` before a
+1. Add a finite `train.max_epochs` to `examples/awm/lora/anima/default.yaml` before a
    formal unattended run.
 2. Decide whether reward services should run on CPU, on a second GPU, or in
    serialized CUDA offload mode on the training GPU.

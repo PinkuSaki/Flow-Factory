@@ -29,28 +29,65 @@ Determine your algorithm's characteristics:
 
 ### Step 1 — Define Algorithm-Specific Arguments
 
-Add a new `TrainingArguments` subclass in `src/flow_factory/hparams/training_args.py`:
+Create a new file `src/flow_factory/hparams/training_args/my_algo.py`:
 
 ```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+from ._base import TrainingArguments
+
+
+@dataclass
 class MyAlgoTrainingArguments(TrainingArguments):
     """Training arguments specific to MyAlgo."""
-    my_specific_param: float = 0.1
-    another_param: int = 10
+    my_specific_param: float = field(
+        default=0.1,
+        metadata={"help": "Description of param."},
+    )
+    another_param: int = field(
+        default=10,
+        metadata={"help": "Description of param."},
+    )
 ```
+
+If the algorithm uses a different CFG `guidance_scale` at optimize time than at sampling/rollout time (e.g., `kl_cfg` for a reference-model branch), override `get_preprocess_guidance_scale()` so the data preprocessing stage encodes negative prompts:
+
+```python
+def get_preprocess_guidance_scale(self) -> float:
+    """Ensure negative prompts are encoded when optimize-time CFG needs them."""
+    return max(self.guidance_scale, self.my_optimize_cfg)
+```
+
+See `topics/adapter_conventions.md` "Classifier-Free Guidance (CFG) Convention" for the full two-stage CFG contract.
 
 ### Step 2 — Register in Argument Resolver
 
-Update `get_training_args_class()` in `hparams/training_args.py`:
+Update three files in `src/flow_factory/hparams/training_args/`:
+
+**a)** Add import + registry entry in `_registry.py`:
 
 ```python
-def get_training_args_class(trainer_type: str):
-    mapping = {
-        'grpo': GRPOTrainingArguments,
-        'nft': NFTTrainingArguments,
-        'awm': AWMTrainingArguments,
-        'my_algo': MyAlgoTrainingArguments,  # Add this
-    }
-    return mapping.get(trainer_type, TrainingArguments)
+from .my_algo import MyAlgoTrainingArguments
+
+_TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
+    ...
+    'my_algo': MyAlgoTrainingArguments,  # Add this
+}
+```
+
+**b)** Add re-export in `__init__.py`:
+
+```python
+from .my_algo import MyAlgoTrainingArguments
+# Also add to __all__
+```
+
+**c)** Add re-export in `src/flow_factory/hparams/__init__.py`:
+
+```python
+from .training_args import MyAlgoTrainingArguments
+# Also add to __all__
 ```
 
 ## Phase 3: Trainer Implementation
@@ -88,9 +125,8 @@ class MyAlgoTrainer(BaseTrainer):
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    def evaluate(self):
-        """Evaluation loop — reuse pattern from GRPO/NFT."""
-        pass
+    # NOTE: evaluate() is a CONCRETE BaseTrainer method (called by the loop above).
+    # Override it only to customize evaluation — it is NOT an abstract method.
 
     def sample(self):
         """Stages 2-3: K-repeat sampling + trajectory generation."""
@@ -107,13 +143,14 @@ class MyAlgoTrainer(BaseTrainer):
 
     def optimize(self, samples):
         """Stage 6: Policy update."""
-        # Use self.adapter.forward() for single-step denoising
+        # Use self.adapter.forward() for single-step denoising.
+        # Per-forward autocast — never one outer autocast around the loop (#20a).
         # Compute loss, backprop, step
         pass
 ```
 
 > **Note**: `AdvantageProcessor` is auto-instantiated in `BaseTrainer._init_reward_model()`.
-> All trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation".
+> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation". (Pure-distillation trainers like `diffusion-opd` skip rewards/advantages with a no-op `prepare_feedback()`.)
 
 ### Step 4 — Register in Trainer Registry
 
@@ -125,12 +162,12 @@ Add to `_TRAINER_REGISTRY` in `src/flow_factory/trainers/registry.py`:
 
 ## Phase 4: Configuration & Examples
 
-Create example config `examples/my_algo/lora/flux1.yaml`:
+Create example config `examples/my_algo/lora/flux1/default.yaml`:
 
 ```yaml
 model:
   model_type: "flux1"
-  model_path: "black-forest-labs/FLUX.1-dev"
+  model_name_or_path: "black-forest-labs/FLUX.1-dev"
   finetune_type: "lora"
   target_components: ["transformer"]
 
@@ -146,11 +183,19 @@ scheduler:
   dynamics_type: "ODE"          # Or appropriate dynamics
 
 data:
-  dataset: "path/to/dataset"
+  datasets:
+    - name: default
+      dataset_dir: "path/to/dataset"   # Folder with train.jsonl / test.jsonl
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval: {}
 
 rewards:
-  reward_model: "PickScore"
-  batch_size: 16
+  - name: "pickscore"
+    reward_model: "pickscore"
+    weight: 1.0
+    batch_size: 16
 ```
 
 ## Phase 5: Verification
@@ -169,9 +214,10 @@ rewards:
 ## Common Pitfalls
 
 1. **Not subclassing `TrainingArguments`** — algorithm-specific params won't be parsed from YAML
-2. **Forgetting `get_training_args_class` update** — falls back to base `TrainingArguments`, losing custom params
+2. **Forgetting `_registry.py` + `__init__.py` updates** — falls back to base `TrainingArguments`, losing custom params
 3. **Using ODE with coupled paradigm** — no log-probabilities available, silent incorrect gradients
 4. **Not calling `self.should_continue_training()`** — infinite loop if `max_epochs` is set
 5. **Duplicating `_initialization()` logic** — already called in `BaseTrainer.__init__`; don't re-prepare modules
 6. **Reimplementing advantage gather/scatter** — use `self.advantage_processor.compute_advantages()` instead; it handles both sampler topologies automatically
 7. **Extending `GRPOTrainer` unnecessarily** — unless your algorithm extends GRPO's PPO-clipped loss, extend `BaseTrainer` directly (as NFT and AWM do)
+8. **Optimizer-time CFG without `get_preprocess_guidance_scale()`** — if your algorithm calls `adapter.forward(guidance_scale=X)` where X > 1.0 but `training_args.guidance_scale` ≤ 1.0, negative prompts won't be encoded at preprocessing time and CFG silently falls back to no-CFG. Override `get_preprocess_guidance_scale()` in your TrainingArguments subclass to return `max(guidance_scale, your_optimize_cfg)`. See DGPO's `kl_cfg` for a real example.

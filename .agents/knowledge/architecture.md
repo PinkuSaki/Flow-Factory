@@ -35,7 +35,10 @@
 | `rewards/abc.py` | `hparams` | All reward models, `trainers/abc.py` |
 | `data_utils/` | `hparams` | `trainers/abc.py` |
 | `scheduler/` | (standalone) | `models/abc.py` |
-| `samples/` | (standalone) | `models/`, `rewards/` |
+| `samples/` | `utils/` | `models/`, `rewards/`, `advantage/`, `trainers/` |
+| `ema/` | `utils/` | `models/abc.py` |
+| `logger/` | `hparams` | `trainers/abc.py` |
+| `utils/` | (standalone) | Most modules |
 
 ---
 
@@ -46,13 +49,14 @@
 ```
 Stage 1: Data Preprocessing (offline, cached)
   │  GeneralDataset + adapter.preprocess_func()
-  │  Text/image/video → encoded tensors (prompt_embeds, image_latents, ...)
+  │  Text/image/video/audio → encoded tensors (prompt_embeds, image_latents, audio_features, ...)
   │  Result cached with hash fingerprint
   ▼
 Stage 2: K-Repeat Sampling
-  │  Two sampler strategies (see `topics/samplers.md`):
+  │  Three sampler strategies (see `topics/samplers.md`):
   │  - GroupContiguousSampler (preferred, auto-selected): keeps K copies on same rank
   │  - DistributedKRepeatSampler (fallback): shuffles K copies across ranks
+  │  - GroupDistributedSampler (DGPO): rank-identical prompt sequence, K/W copies per rank
   │  K = training_args.group_size
   ▼
 Stage 3: Trajectory Generation
@@ -66,7 +70,7 @@ Stage 4: Reward Computation
 Stage 5: Advantage Computation
   │  AdvantageProcessor (advantage/advantage_processor.py)
   │  Communication-aware: auto-selects gather vs local path
-  │  Strategies: weighted-sum (GRPO) or GDPO
+  │  Strategies: "sum" (weighted-sum, GRPO) or "gdpo"
   ▼
 Stage 6: Policy Optimization
   │  adapter.forward() — single-step denoising for loss computation
@@ -93,13 +97,20 @@ All three registries map string keys → lazy import paths. Resolution: registry
 ### Registered Components
 
 **Trainers** (`trainers/registry.py`):
+
 | Key | Class | Paradigm | Base Class |
 |-----|-------|----------|------------|
 | `grpo` | `GRPOTrainer` | Coupled | `BaseTrainer` |
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
+| `dppo` | `DPPOTrainer` | Coupled | `GRPOTrainer` |
 | `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
+| `dgpo` | `DGPOTrainer` | Decoupled | `BaseTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
+| `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
+| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
+
+**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
 
 **Model Adapters** (`models/registry.py`):
 | Key | Class | Task |
@@ -116,6 +127,9 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `wan2_t2v` | `Wan2_T2V_Adapter` | Text-to-Video |
 | `wan2_i2v` | `Wan2_I2V_Adapter` | Image-to-Video |
 | `wan2_v2v` | `Wan2_V2V_Adapter` | Video-to-Video |
+| `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
+| `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
+| `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
 
 **Reward Models** (`rewards/registry.py`):
 | Key | Class | Type |
@@ -123,8 +137,16 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `pickscore` | `PickScoreRewardModel` | Pointwise |
 | `pickscore_rank` | `PickScoreRankRewardModel` | Groupwise |
 | `clip` | `CLIPRewardModel` | Pointwise |
+| `clap` | `CLAPRewardModel` | Pointwise |
+| `imagebind` | `ImageBindRewardModel` | Pointwise |
 | `ocr` | `OCRRewardModel` | Pointwise |
 | `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
+| `rational_rewards_t2i` | `RationalRewardsT2IRewardModel` | Pointwise |
+| `rational_rewards_edit` | `RationalRewardsEditRewardModel` | Pointwise |
+| `geneval` | `GenEvalRewardModel` | Pointwise |
+| `geneval2_soft_tifa` | `GenEval2SoftTIFARewardModel` | Pointwise |
+| `hpsv2` | `HPSv2RewardModel` | Pointwise |
+| `qwen_image_bench` | `QwenImageBenchRewardModel` | Pointwise |
 
 ---
 
@@ -148,7 +170,14 @@ Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface:
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
 
+**Per-modality encoders** (`encode_prompt`, `encode_image`, `encode_video`, `encode_audio`) are no-op by default on `BaseAdapter` — override only the modalities your model consumes. `preprocess_func` dispatches to all four and skips any that return `None`, so text/image/video-only adapters need no stub overrides for unused modalities.
+
+**Flat hierarchy**: All adapters inherit directly from `BaseAdapter` — never from another adapter (see constraint #12). Shared logic within a model family uses helper functions, code duplication, or mixins — not adapter subclassing.
+
 Details: `topics/adapter_conventions.md`
+
+### Sample Dataclass Hierarchy
+Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
 ### Component Management
 `BaseAdapter` discovers pipeline components and manages lifecycle: freezing, LoRA, offloading, mode switching (`train`/`eval`/`rollout`).
@@ -161,7 +190,7 @@ Details: `topics/adapter_conventions.md`
 - **Async**: optional non-blocking computation
 
 ### Advantage Computation
-`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All trainers delegate to `self.advantage_processor.compute_advantages()`.
+`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
 
 ### Configuration Hierarchy
 ```

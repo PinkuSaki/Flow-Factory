@@ -22,12 +22,18 @@ from .scheduler_args import SchedulerArguments
 from .training_args import (
     TrainingArguments,
     GRPOTrainingArguments,
+    DPPOTrainingArguments,
     NFTTrainingArguments,
     AWMTrainingArguments,
+    DGPOTrainingArguments,
     DPOTrainingArguments,
+    CRDTrainingArguments,
+    DiffusionOPDTrainingArguments,
+    TeacherConfig,
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
+from .dataset_args import DatasetArguments, DatasetTrainSpec, DatasetEvalSpec
 from .log_args import LogArguments
 
 
@@ -38,11 +44,19 @@ __all__ = [
     "SchedulerArguments",
     "TrainingArguments",
     "GRPOTrainingArguments",
+    "DPPOTrainingArguments",
     "NFTTrainingArguments",
     "AWMTrainingArguments",
+    "DGPOTrainingArguments",
     "DPOTrainingArguments",
+    "CRDTrainingArguments",
+    "DiffusionOPDTrainingArguments",
+    "TeacherConfig",
     "get_training_args_class",
     "RewardArguments",
     "MultiRewardArguments",
+    "DatasetArguments",
+    "DatasetTrainSpec",
+    "DatasetEvalSpec",
     "LogArguments",
 ]

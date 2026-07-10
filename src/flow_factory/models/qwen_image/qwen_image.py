@@ -24,10 +24,12 @@ from collections import defaultdict
 from PIL import Image
 import torch
 from torch.nn.utils.rnn import pad_sequence
+import diffusers
 from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from accelerate import Accelerator
 
 from ..abc import BaseAdapter
+from ._utils import _pad_seq_dim
 from ...samples import T2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -62,8 +64,20 @@ class QwenImageSample(T2ISample):
 
 class QwenImageAdapter(BaseAdapter):
     """Adapter for Qwen-Image text-to-image models."""
-    
+
+    # Qwen-Image runs with guidance=None, so the transformer's guidance embedder
+    # receives no gradient and DDP must scan for unused parameters.
+    ddp_find_unused_parameters = True
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
+        if not is_version_at_least("diffusers", "0.37.0"):
+            raise ImportError(
+                "QwenImageAdapter requires diffusers>=0.37.0 (the Qwen-Image "
+                "transformer derives the text sequence length from "
+                "encoder_hidden_states_mask; txt_seq_lens is no longer passed). "
+                f"Found diffusers {diffusers.__version__}. "
+                "Upgrade with `pip install -U 'diffusers>=0.37.0'`."
+            )
         super().__init__(config, accelerator)
         self.pipeline: QwenImagePipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
@@ -137,6 +151,7 @@ class QwenImageAdapter(BaseAdapter):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
+        guidance_scale: float = 4.0,
         max_sequence_length: int = 1024,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
@@ -146,9 +161,9 @@ class QwenImageAdapter(BaseAdapter):
 
         device = device or self.pipeline.text_encoder.device
         dtype = dtype or self.pipeline.text_encoder.dtype
+        do_classifier_free_guidance = guidance_scale > 1.0
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
 
         # Encode positive prompt
         prompt_ids, prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
@@ -166,7 +181,11 @@ class QwenImageAdapter(BaseAdapter):
             "prompt_embeds_mask": prompt_embeds_mask,
         }
         # Encode negative prompt
-        if negative_prompt:
+        if do_classifier_free_guidance:
+            negative_prompt = "" if negative_prompt is None else negative_prompt
+            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
+            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
             negative_prompt_ids, negative_prompt_embeds, negative_prompt_embeds_mask = self._get_qwen_prompt_embeds(
                 prompt=negative_prompt,
                 device=device,
@@ -239,12 +258,11 @@ class QwenImageAdapter(BaseAdapter):
     ):
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
-            txt_seq_lens = [mask.sum() for mask in prompt_embeds_mask]
+            max_pos_len = max(1, int(max(mask.sum() for mask in prompt_embeds_mask)))
         else:
             device = device or prompt_embeds_mask.device
-            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+            max_pos_len = max(1, int(prompt_embeds_mask.sum(dim=1).max()))
 
-        max_pos_len = max(txt_seq_lens)
         if prompt_ids is not None:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             padded_prompt_ids = self._standardize_data(
@@ -272,13 +290,7 @@ class QwenImageAdapter(BaseAdapter):
             device=device,
             max_len=max_pos_len,
         )
-        # Make the output order the args order
-        return (
-            txt_seq_lens,
-            padded_prompt_embeds_mask,
-            padded_prompt_embeds,
-            padded_prompt_ids,
-        )
+        return padded_prompt_embeds_mask, padded_prompt_embeds, padded_prompt_ids
 
     # ======================== Inference ========================
     @torch.no_grad()
@@ -308,23 +320,21 @@ class QwenImageAdapter(BaseAdapter):
         trajectory_indices: TrajectoryIndicesType = 'all',
     ):
         # 1. Prepare inputs
-        # Qwen-Image uses `true_cfg_scale` since it is not a guidance-distilled model.
-        true_cfg_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         device = self.device
         dtype = self.pipeline.transformer.dtype
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
 
-        if true_cfg_scale > 1 and not has_neg_prompt and not self._warned_cfg_no_neg_prompt:
+        if guidance_scale > 1 and not has_neg_prompt and not self._warned_cfg_no_neg_prompt:
             self._warned_cfg_no_neg_prompt = True
             logger.warning(
-                f"true_cfg_scale is passed as {true_cfg_scale}, but classifier-free guidance is not enabled since no negative_prompt is provided. Warning will only be shown once."
+                f"guidance_scale is passed as {guidance_scale}, but classifier-free guidance is not enabled since no negative_prompt is provided. Warning will only be shown once."
             )
-        elif true_cfg_scale <= 1 and has_neg_prompt and not self._warned_no_cfg:
+        elif guidance_scale <= 1 and has_neg_prompt and not self._warned_no_cfg:
             self._warned_no_cfg = True
             logger.warning(
-                " negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1. Warning will only be shown once."
+                " negative_prompt is passed but classifier-free guidance is not enabled since guidance_scale <= 1. Warning will only be shown once."
             )
 
         # 2. Get prompt embeddings
@@ -335,6 +345,7 @@ class QwenImageAdapter(BaseAdapter):
             encoded = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
+                guidance_scale=guidance_scale,
                 max_sequence_length=max_sequence_length,
                 device=device,
                 dtype=dtype,
@@ -401,7 +412,7 @@ class QwenImageAdapter(BaseAdapter):
                 img_shapes=img_shapes,
                 negative_prompt_embeds=negative_prompt_embeds,
                 negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-                guidance_scale=true_cfg_scale,
+                guidance_scale=guidance_scale,
                 attention_kwargs=attention_kwargs,
                 compute_log_prob=current_compute_log_prob,
                 return_kwargs=return_kwargs,
@@ -520,55 +531,61 @@ class QwenImageAdapter(BaseAdapter):
             negative_prompt_embeds is not None
             and negative_prompt_embeds_mask is not None
         )
-        do_true_cfg = guidance_scale > 1 and has_negative_prompt
+        if guidance_scale > 1.0 and not has_negative_prompt:
+            logger.warning(
+                "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. "
+                "Classifier-free guidance will be disabled."
+            )
+        do_true_cfg = guidance_scale > 1.0 and has_negative_prompt
 
-        # Prepare txt_seq_lens and negative_txt_seq_lens, which will be deprecated in `diffuers==0.39.0`,
-        # to update, just modify the following lines accordingly.
-        # Truncate prompt embeddings and masks to max valid lengths in the batch
-        txt_seq_lens, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
+        # Truncate prompt embeddings and masks to the max valid length in the
+        # batch. diffusers (>=0.38) derives the per-sample text length from
+        # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
+        prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_true_cfg:
-            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
+            negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
             )
-        else:
-            negative_txt_seq_lens = None
 
         # 2. Transformer forward pass
-        # Conditional forward pass
-        with self.pipeline.transformer.cache_context("cond"):
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
+        if do_true_cfg:
+            # Merge cond/uncond into one batched forward (halves transformer
+            # calls). Pad both text streams to a common length; the
+            # encoder_hidden_states_mask masks the extra positions and diffusers
+            # derives each sample's length from it, so valid outputs match two
+            # separate forwards. RL has no cross-step caching, so dropping the
+            # per-branch cache_context is a no-op. Tradeoff: ~2x peak activation
+            # memory vs two serial forwards (lower batch/resolution if it OOMs).
+            seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
+            prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
+            prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
+            negative_prompt_embeds = _pad_seq_dim(negative_prompt_embeds, seq_len, 0.0)
+            negative_prompt_embeds_mask = _pad_seq_dim(
+                negative_prompt_embeds_mask, seq_len, 0
+            )
+
+            both_pred = self.transformer(
+                hidden_states=torch.cat([latents, latents], dim=0),
+                timestep=torch.cat([timestep, timestep], dim=0) / 1000,
                 guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
+                encoder_hidden_states_mask=torch.cat(
+                    [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
+                ),
+                encoder_hidden_states=torch.cat(
+                    [prompt_embeds, negative_prompt_embeds], dim=0
+                ),
+                img_shapes=img_shapes * 2,
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
-
-        # CFG: unconditional forward pass
-        if do_true_cfg:
-            with self.pipeline.transformer.cache_context("uncond"):
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
+            noise_pred, neg_noise_pred = both_pred.chunk(2, dim=0)
 
             comb_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
@@ -576,6 +593,19 @@ class QwenImageAdapter(BaseAdapter):
             cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
             noise_pred = comb_pred * (cond_norm / noise_norm)
+        else:
+            # Single conditional forward pass (no CFG).
+            with self.pipeline.transformer.cache_context("cond"):
+                noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
 
         # 3. Scheduler step
         output = self.scheduler.step(

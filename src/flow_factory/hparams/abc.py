@@ -18,6 +18,10 @@ from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict
 from abc import ABC, abstractmethod
 
+from ..utils.logger_utils import setup_logger
+
+logger = setup_logger(__name__, rank_zero_only=True)
+
 
 @dataclass(kw_only=True)
 class ArgABC(ABC):
@@ -42,6 +46,14 @@ class ArgABC(ABC):
             else:
                 extras[k] = v
 
+        if extras:
+            logger.warning(
+                f"{cls.__name__}.from_dict captured {len(extras)} unknown key(s) into extra_kwargs: "
+                f"{sorted(extras.keys())}. "
+                "Verify these are intentional (e.g., adapter-specific kwargs); "
+                "typos against declared fields will be silently accepted otherwise."
+            )
+
         # 2. If the class has an 'extra_kwargs' field, inject the leftovers there
         if "extra_kwargs" in field_names:
             # If the config actually had an explicit "extra_kwargs" key, merge it
@@ -54,11 +66,20 @@ class ArgABC(ABC):
         return cls(**init_data)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dict, flattening extra_kwargs into the root."""
+        """Convert to dict, flattening extra_kwargs into the root.
+
+        Fields whose names start with ``_`` are runtime/internal caches
+        (e.g. ``RewardArguments._datasets_resolved``) and are omitted from
+        the export so they never leak into config sinks (wandb / SwanLab
+        config, YAML dump, checkpoint metadata).
+        """
         d = asdict(self)
         extras = d.pop("extra_kwargs", {})
+        for key in list(d):
+            if key.startswith("_"):
+                del d[key]
         # Merge extras back into the main dict for a clean export
-        d.update(extras) 
+        d.update(extras)
         return d
 
     def __getattr__(self, name: str) -> Any:

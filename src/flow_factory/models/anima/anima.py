@@ -387,6 +387,11 @@ class AnimaAdapter(BaseAdapter):
             loading_device="cpu",
             dit_weight_dtype=load_dtype,
         )
+        # The external sd-scripts model does not declare FSDP wrapping hints.
+        # Expose both repeated transformer block types so ModelBundle can build
+        # a block-level TRANSFORMER_BASED_WRAP policy instead of one monolithic
+        # FSDP unit.
+        transformer._no_split_modules = ["Block", "LLMAdapterTransformerBlock"]
         if self.model_args.llm_adapter_path is not None:
             llm_adapter_state_dict = _load_optional_state_dict(self.model_args.llm_adapter_path)
             stripped_state_dict = {
@@ -495,7 +500,7 @@ class AnimaAdapter(BaseAdapter):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
-        do_classifier_free_guidance: bool = True,
+        guidance_scale: float = 4.0,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         qwen3_max_length: Optional[int] = None,
@@ -521,7 +526,7 @@ class AnimaAdapter(BaseAdapter):
             t5_max_length=t5_max_length,
         )
 
-        if do_classifier_free_guidance:
+        if guidance_scale > 1.0:
             if negative_prompt is None:
                 negative_prompt = [""] * len(prompt)
             elif isinstance(negative_prompt, str):
@@ -659,13 +664,19 @@ class AnimaAdapter(BaseAdapter):
             source_attention_mask=prompt_embeds_mask,
         ).squeeze(2)
 
-        do_classifier_free_guidance = (
-            guidance_scale > 1.0
-            and negative_prompt_embeds is not None
+        has_negative_condition = (
+            negative_prompt_embeds is not None
             and negative_prompt_embeds_mask is not None
             and negative_t5_input_ids is not None
             and negative_t5_attn_mask is not None
         )
+        if guidance_scale > 1.0 and not has_negative_condition:
+            logger.warning(
+                "Anima received guidance_scale(%s) > 1.0 but negative conditioning "
+                "is incomplete; falling back to the no-CFG path.",
+                guidance_scale,
+            )
+        do_classifier_free_guidance = guidance_scale > 1.0 and has_negative_condition
         if do_classifier_free_guidance:
             neg_noise_pred = self.transformer(
                 model_latents,
@@ -732,7 +743,7 @@ class AnimaAdapter(BaseAdapter):
             encoded = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_scale > 1.0,
+                guidance_scale=guidance_scale,
                 device=device,
                 dtype=dtype,
             )
