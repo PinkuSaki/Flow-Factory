@@ -124,12 +124,14 @@ Reward stack:
 
 - `aesthetic_shadow`: remote Aesthetic Shadow pointwise reward at `http://127.0.0.1:18081`
 - `wd_reference_similarity`: remote WD EVA02 prompt-hash similarity reward at `http://127.0.0.1:18082`
+- WD checkpoint: `../models/eva02_large_patch14_448.dbv4-full`
 - WD reference embedding cache: `dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt`
 - WD cache coverage: `4049` prompt hashes, matching the full source JSONL
 
 Operational notes:
 
 - The WD cache does not need to be rebuilt after the train/test split because it covers all source prompts.
+  It must be rebuilt whenever the WD weights or `preprocess.json` changes.
 - `examples/awm/lora/anima/default.yaml` currently omits `train.max_epochs`; this means training runs until interrupted. Set a finite value before unattended formal runs.
 
 ## Reproducible Smoke Runner

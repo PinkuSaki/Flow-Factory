@@ -95,11 +95,13 @@ VRAM for the reward service.
 
 - Reward name: `wd_reference_similarity`
 - Config class: `flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel`
-- Local checkpoint: `/root/reward_models/wd-eva02-large-tagger-v3`
+- Local checkpoint: `../models/eva02_large_patch14_448.dbv4-full`
 - Reference embedding cache: `dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt`
 - Endpoint: `http://127.0.0.1:18082`
 - Runtime behavior: hash each prompt, look up the cached reference embedding,
   encode the generated image, and return cosine similarity.
+- Cache compatibility: rebuild the cache after changing the WD weights or
+  `preprocess.json`; the server rejects a model-fingerprint mismatch.
 
 Reference command:
 
@@ -107,11 +109,10 @@ Reference command:
 python scripts/reward_servers/wd_prompt_hash_server.py \
   --host 127.0.0.1 \
   --port 18082 \
-  --model-path /root/reward_models/wd-eva02-large-tagger-v3 \
+  --model-path ../models/eva02_large_patch14_448.dbv4-full \
   --cache-path dataset/anime_custom_single_gpu_eval16/wd_prompt_hash_cache.pt \
   --device cpu \
-  --dtype float32 \
-  --max-batch-size 1
+  --dtype float32
 ```
 
 ## Single-GPU Validation Status

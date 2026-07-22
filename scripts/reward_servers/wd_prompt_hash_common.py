@@ -19,14 +19,31 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageOps
+from PIL import Image, ImageColor, ImageOps
+
+WD_MODEL_FINGERPRINT_FILES = ("config.json", "preprocess.json", "model.safetensors")
+WD_CONFIGURED_TRANSFORM_TYPES = (
+    "pad_to_size",
+    "resize",
+    "center_crop",
+    "maybe_to_tensor",
+    "normalize",
+)
+PIL_INTERPOLATIONS = {
+    "nearest": Image.Resampling.NEAREST,
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "box": Image.Resampling.BOX,
+    "hamming": Image.Resampling.HAMMING,
+    "lanczos": Image.Resampling.LANCZOS,
+}
 
 
 @dataclass(frozen=True)
@@ -36,6 +53,7 @@ class WDReferenceCache:
     prompt_hashes: list[str]
     embeddings: dict[str, torch.Tensor]
     probabilities: Optional[dict[str, torch.Tensor]] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def require_probabilities(self) -> dict[str, torch.Tensor]:
         """Return reference probabilities or fail with a rebuild hint."""
@@ -54,6 +72,36 @@ class WDImageOutputs:
 
     embeddings: torch.Tensor
     probabilities: torch.Tensor
+
+
+@dataclass(frozen=True)
+class WDPreprocessSpec:
+    """Describe the deterministic WD image preprocessing pipeline."""
+
+    source: str
+    pad_size: Optional[tuple[int, int]]
+    pad_interpolation: Image.Resampling
+    pad_background: tuple[int, int, int]
+    resize_size: tuple[int, int]
+    resize_interpolation: Image.Resampling
+    crop_size: tuple[int, int]
+    image_mean: tuple[float, float, float]
+    image_std: tuple[float, float, float]
+
+
+def get_default_wd_dtype() -> str:
+    """Select the fastest supported default WD inference dtype.
+
+    Returns:
+        ``float32`` on CPU-only hosts, otherwise ``bfloat16`` when supported or ``float16``.
+    """
+    if not torch.cuda.is_available():
+        return "float32"
+    supports_native_bfloat16 = all(
+        torch.cuda.get_device_capability(device_index)[0] >= 8
+        for device_index in range(torch.cuda.device_count())
+    )
+    return "bfloat16" if supports_native_bfloat16 else "float16"
 
 
 def prompt_sha256(prompt: str) -> str:
@@ -128,6 +176,11 @@ def load_reference_cache_payload(cache_path: Path) -> WDReferenceCache:
                 for index, prompt_hash in enumerate(prompt_hashes)
             }
 
+        metadata = {
+            str(key): value
+            for key, value in payload.items()
+            if key not in {"prompt_hashes", "embeddings", "probabilities"}
+        }
         return WDReferenceCache(
             prompt_hashes=[str(prompt_hash) for prompt_hash in prompt_hashes],
             embeddings={
@@ -135,6 +188,7 @@ def load_reference_cache_payload(cache_path: Path) -> WDReferenceCache:
                 for index, prompt_hash in enumerate(prompt_hashes)
             },
             probabilities=probabilities,
+            metadata=metadata,
         )
 
     if isinstance(payload, dict):
@@ -252,17 +306,267 @@ def save_reference_cache(
 def _load_model_config(model_path: Path) -> dict[str, Any]:
     """Load WD timm model configuration."""
     config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"WD model config does not exist: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
+def compute_wd_model_fingerprint(model_path: Path) -> str:
+    """Compute a stable fingerprint over WD weights and preprocessing metadata.
+
+    Args:
+        model_path: Local WD checkpoint directory.
+
+    Returns:
+        SHA256 digest covering the model config, optional preprocessing config, and weights.
+    """
+    required_paths = (model_path / "config.json", model_path / "model.safetensors")
+    missing_paths = [path for path in required_paths if not path.is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "WD model fingerprint requires config.json and model.safetensors. "
+            f"Missing: {', '.join(str(path) for path in missing_paths)}"
+        )
+
+    digest = hashlib.sha256()
+    for filename in WD_MODEL_FINGERPRINT_FILES:
+        path = model_path / filename
+        if not path.exists():
+            continue
+        digest.update(filename.encode("utf-8"))
+        digest.update(path.stat().st_size.to_bytes(8, byteorder="big", signed=False))
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_reference_cache_for_model(
+    reference_cache: WDReferenceCache,
+    model_path: Path,
+) -> str:
+    """Validate that a WD reference cache was built with the active model.
+
+    Args:
+        reference_cache: Loaded prompt-hash reference cache.
+        model_path: Local WD checkpoint directory used for generated-image inference.
+
+    Returns:
+        Fingerprint of the validated WD checkpoint.
+    """
+    model_config = _load_model_config(model_path)
+    model_fingerprint = compute_wd_model_fingerprint(model_path)
+    cached_fingerprint = reference_cache.metadata.get("model_fingerprint")
+    if cached_fingerprint is None:
+        raise ValueError(
+            "The WD reference cache does not contain model_fingerprint metadata. "
+            "Rebuild it with build_wd_prompt_hash_cache.py before starting the WD server."
+        )
+    if str(cached_fingerprint) != model_fingerprint:
+        raise ValueError(
+            "The WD reference cache was built with a different model or preprocessing config: "
+            f"cache_fingerprint={cached_fingerprint} model_fingerprint={model_fingerprint}. "
+            "Rebuild the cache with the same --model-path used by the reward server."
+        )
+
+    expected_embedding_dim = int(model_config["num_features"])
+    embedding_shapes = {tuple(value.shape) for value in reference_cache.embeddings.values()}
+    if embedding_shapes != {(expected_embedding_dim,)}:
+        raise ValueError(
+            "WD cache embedding shape mismatch: "
+            f"cache_shapes={sorted(embedding_shapes)} expected=({expected_embedding_dim},)."
+        )
+
+    if reference_cache.probabilities is not None:
+        expected_probability_dim = int(model_config["num_classes"])
+        probability_shapes = {
+            tuple(value.shape) for value in reference_cache.probabilities.values()
+        }
+        if probability_shapes != {(expected_probability_dim,)}:
+            raise ValueError(
+                "WD cache probability shape mismatch: "
+                f"cache_shapes={sorted(probability_shapes)} "
+                f"expected=({expected_probability_dim},)."
+            )
+    return model_fingerprint
+
+
+def _parse_size(value: Any, field_name: str) -> tuple[int, int]:
+    """Parse a positive two-dimensional size."""
+    if isinstance(value, int):
+        size = (value, value)
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        size = (int(value[0]), int(value[1]))
+    else:
+        raise ValueError(f"{field_name} must be an int or a two-item sequence, got {value!r}.")
+    if min(size) <= 0:
+        raise ValueError(f"{field_name} must be positive, got {size}.")
+    return size
+
+
+def _parse_interpolation(value: Any, field_name: str) -> Image.Resampling:
+    """Parse a Pillow interpolation name."""
+    interpolation_name = str(value).lower()
+    if interpolation_name not in PIL_INTERPOLATIONS:
+        raise ValueError(
+            f"Unsupported {field_name} interpolation {value!r}. "
+            f"Supported values: {sorted(PIL_INTERPOLATIONS)}."
+        )
+    return PIL_INTERPOLATIONS[interpolation_name]
+
+
+def _parse_rgb_color(value: Any, field_name: str) -> tuple[int, int, int]:
+    """Parse an RGB background color."""
+    if isinstance(value, str):
+        return ImageColor.getrgb(value)
+    if isinstance(value, int):
+        if not 0 <= value <= 255:
+            raise ValueError(f"{field_name} integer must be in [0, 255], got {value}.")
+        return (value, value, value)
+    if isinstance(value, (list, tuple)) and len(value) in {3, 4}:
+        rgb = tuple(int(channel) for channel in value[:3])
+        if any(channel < 0 or channel > 255 for channel in rgb):
+            raise ValueError(f"{field_name} channels must be in [0, 255], got {rgb}.")
+        return rgb
+    raise ValueError(f"Unsupported {field_name} color: {value!r}.")
+
+
+def _parse_channel_values(value: Any, field_name: str) -> tuple[float, float, float]:
+    """Parse three floating-point channel values."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{field_name} must contain three channel values, got {value!r}.")
+    return tuple(float(channel) for channel in value)
+
+
+def _load_preprocess_spec(
+    model_path: Path,
+    model_config: dict[str, Any],
+) -> WDPreprocessSpec:
+    """Load configured DBV4 preprocessing or the legacy WD square-padding pipeline."""
+    pretrained_cfg = model_config.get("pretrained_cfg", {})
+    input_size = pretrained_cfg.get("input_size", [3, 448, 448])
+    if not isinstance(input_size, (list, tuple)) or len(input_size) != 3:
+        raise ValueError(f"pretrained_cfg.input_size must have three values, got {input_size!r}.")
+    legacy_resize_size = (int(input_size[2]), int(input_size[1]))
+    legacy_mean = _parse_channel_values(
+        pretrained_cfg.get("mean", [0.5, 0.5, 0.5]),
+        "pretrained_cfg.mean",
+    )
+    legacy_std = _parse_channel_values(
+        pretrained_cfg.get("std", [0.5, 0.5, 0.5]),
+        "pretrained_cfg.std",
+    )
+
+    preprocess_path = model_path / "preprocess.json"
+    if not preprocess_path.exists():
+        return WDPreprocessSpec(
+            source="legacy_square",
+            pad_size=None,
+            pad_interpolation=Image.Resampling.BILINEAR,
+            pad_background=(255, 255, 255),
+            resize_size=legacy_resize_size,
+            resize_interpolation=_parse_interpolation(
+                pretrained_cfg.get("interpolation", "bicubic"),
+                "pretrained_cfg",
+            ),
+            crop_size=legacy_resize_size,
+            image_mean=legacy_mean,
+            image_std=legacy_std,
+        )
+
+    with preprocess_path.open("r", encoding="utf-8") as handle:
+        preprocess_payload = json.load(handle)
+    test_transforms = preprocess_payload.get("test")
+    if not isinstance(test_transforms, list):
+        raise ValueError(f"{preprocess_path} must contain a list-valued 'test' pipeline.")
+    transform_types = tuple(transform.get("type") for transform in test_transforms)
+    if transform_types != WD_CONFIGURED_TRANSFORM_TYPES:
+        raise ValueError(
+            f"Unsupported WD test preprocessing pipeline {transform_types}. "
+            f"Expected {WD_CONFIGURED_TRANSFORM_TYPES}."
+        )
+
+    pad_transform, resize_transform, crop_transform, _, normalize_transform = test_transforms
+    pad_size = _parse_size(pad_transform.get("size"), "pad_to_size.size")
+    resize_height, resize_width = _parse_size(resize_transform.get("size"), "resize.size")
+    crop_height, crop_width = _parse_size(crop_transform.get("size"), "center_crop.size")
+    resize_size = (resize_width, resize_height)
+    crop_size = (crop_width, crop_height)
+    if resize_size != crop_size:
+        raise ValueError(
+            "WD configured preprocessing currently requires resize.size and center_crop.size "
+            f"to match, got resize={resize_size} crop={crop_size}."
+        )
+
+    image_std = _parse_channel_values(normalize_transform.get("std"), "normalize.std")
+    if any(value <= 0.0 for value in image_std):
+        raise ValueError(f"normalize.std values must be positive, got {image_std}.")
+    return WDPreprocessSpec(
+        source="preprocess.json:test",
+        pad_size=pad_size,
+        pad_interpolation=_parse_interpolation(
+            pad_transform.get("interpolation", "bilinear"),
+            "pad_to_size",
+        ),
+        pad_background=_parse_rgb_color(
+            pad_transform.get("background_color", "white"),
+            "pad_to_size.background_color",
+        ),
+        resize_size=resize_size,
+        resize_interpolation=_parse_interpolation(
+            resize_transform.get("interpolation", "bilinear"),
+            "resize",
+        ),
+        crop_size=crop_size,
+        image_mean=_parse_channel_values(normalize_transform.get("mean"), "normalize.mean"),
+        image_std=image_std,
+    )
+
+
+def _convert_to_rgb(image: Image.Image) -> Image.Image:
+    """Apply EXIF orientation and composite transparent pixels over white."""
+    image = ImageOps.exif_transpose(image)
+    has_transparency = image.mode in {"RGBA", "LA"} or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if not has_transparency:
+        return image.convert("RGB")
+
+    foreground = image.convert("RGBA")
+    background = Image.new("RGBA", foreground.size, (255, 255, 255, 255))
+    background.alpha_composite(foreground)
+    return background.convert("RGB")
+
+
 def _pad_to_square(image: Image.Image) -> Image.Image:
     """Pad an RGB image to square using a white background."""
-    image = ImageOps.exif_transpose(image).convert("RGB")
+    image = _convert_to_rgb(image)
     width, height = image.size
     side = max(width, height)
     canvas = Image.new("RGB", (side, side), (255, 255, 255))
     canvas.paste(image, ((side - width) // 2, (side - height) // 2))
+    return canvas
+
+
+def _resize_and_pad_to_size(
+    image: Image.Image,
+    size: tuple[int, int],
+    interpolation: Image.Resampling,
+    background: tuple[int, int, int],
+) -> Image.Image:
+    """Resize an image to fit and center-pad it to an exact size."""
+    target_width, target_height = size
+    width, height = image.size
+    ratio = min(target_width / width, target_height / height)
+    resized_width = round(width * ratio)
+    resized_height = round(height * ratio)
+    image = image.resize((resized_width, resized_height), interpolation)
+    canvas = Image.new("RGB", (target_width, target_height), background)
+    canvas.paste(
+        image,
+        ((target_width - resized_width) // 2, (target_height - resized_height) // 2),
+    )
     return canvas
 
 
@@ -284,12 +588,14 @@ class WDEVA02EmbeddingModel:
             raise ValueError(f"max_batch_size must be positive or None, got {self.max_batch_size}.")
 
         self.model_config = _load_model_config(model_path)
-        pretrained_cfg = self.model_config.get("pretrained_cfg", {})
-        self.image_size = int(pretrained_cfg.get("input_size", [3, 448, 448])[-1])
-        self.image_mean = tuple(
-            float(value) for value in pretrained_cfg.get("mean", [0.5, 0.5, 0.5])
-        )
-        self.image_std = tuple(float(value) for value in pretrained_cfg.get("std", [0.5, 0.5, 0.5]))
+        self.preprocess_spec = _load_preprocess_spec(model_path, self.model_config)
+        if self.preprocess_spec.crop_size[0] != self.preprocess_spec.crop_size[1]:
+            raise ValueError(
+                f"WD EVA02 requires square model input, got {self.preprocess_spec.crop_size}."
+            )
+        self.image_size = self.preprocess_spec.crop_size[0]
+        self.image_mean = self.preprocess_spec.image_mean
+        self.image_std = self.preprocess_spec.image_std
 
         self.model = self._load_wd_model()
         self.output_model = WDEVA02OutputExtractor(self.model)
@@ -318,11 +624,13 @@ class WDEVA02EmbeddingModel:
                 "Install them with `pip install timm safetensors`."
             ) from exc
 
+        model_args = dict(self.model_config.get("model_args", {}))
+        model_args.setdefault("global_pool", self.model_config.get("global_pool", "avg"))
         model = timm.create_model(
             self.model_config["architecture"],
             pretrained=False,
             num_classes=int(self.model_config["num_classes"]),
-            **self.model_config.get("model_args", {}),
+            **model_args,
         )
         state_dict = load_file(str(self.model_path / "model.safetensors"), device="cpu")
         model.load_state_dict(state_dict, strict=True)
@@ -368,8 +676,20 @@ class WDEVA02EmbeddingModel:
         std = torch.tensor(self.image_std, dtype=torch.float32).view(3, 1, 1)
 
         for image in images:
-            image = _pad_to_square(image)
-            image = image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)
+            image = _convert_to_rgb(image)
+            if self.preprocess_spec.pad_size is None:
+                image = _pad_to_square(image)
+            else:
+                image = _resize_and_pad_to_size(
+                    image=image,
+                    size=self.preprocess_spec.pad_size,
+                    interpolation=self.preprocess_spec.pad_interpolation,
+                    background=self.preprocess_spec.pad_background,
+                )
+            image = image.resize(
+                self.preprocess_spec.resize_size,
+                self.preprocess_spec.resize_interpolation,
+            )
             array = np.asarray(image, dtype=np.float32) / 255.0
             tensor = torch.from_numpy(array).permute(2, 0, 1)
             tensors.append((tensor - mean) / std)

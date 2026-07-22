@@ -11,13 +11,14 @@ CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/shadow_server.py \
 CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/wd_prompt_hash_server.py \
     --host 127.0.0.1 \
     --port 18082 \
-    --model-path /root/reward_models/wd-eva02-large-tagger-v3 \
+    --model-path ../models/eva02_large_patch14_448.dbv4-full \
     --cache-path dataset/anime_custom_artist_eval16/wd_prompt_hash_cache.pt \
     --device cuda \
-    --dtype bfloat16 \
+    --dtype float16 \
     --score-type embedding_cosine
 
 # WD score types: embedding_cosine, soft_jaccard, wd_distribution, negative_bce.
+# Rebuild the WD cache whenever the model weights or preprocess.json changes.
 
 CUDA_VISIBLE_DEVICES=0,1 python scripts/reward_servers/anime_aesthetic_server.py \
     --host 127.0.0.1 \

@@ -28,6 +28,8 @@ import torch
 from PIL import Image
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
+    compute_wd_model_fingerprint,
+    get_default_wd_dtype,
     prompt_sha256,
     read_jsonl,
     resolve_reference_image_path,
@@ -43,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("../models/wd-eva02-large-tagger-v3"),
-        help="Path to the local WD EVA02 tagger checkpoint directory.",
+        default=Path("../models/eva02_large_patch14_448.dbv4-full"),
+        help="Path to the local AnimeTimm EVA02 DBV4 tagger checkpoint directory.",
     )
     parser.add_argument(
         "--reference-jsonl",
@@ -87,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
-        default="bfloat16" if torch.cuda.is_available() else "float32",
+        default=get_default_wd_dtype(),
         help="Torch dtype for CUDA inference. CPU inference always uses float32.",
     )
     parser.add_argument(
@@ -162,6 +164,7 @@ def build_cache(args: argparse.Namespace) -> None:
     reference_embeddings: dict[str, torch.Tensor] = {}
     reference_probabilities: dict[str, torch.Tensor] = {}
 
+    model_fingerprint = compute_wd_model_fingerprint(args.model_path)
     encoder = WDEVA02EmbeddingModel(
         model_path=args.model_path,
         device=args.device,
@@ -180,7 +183,7 @@ def build_cache(args: argparse.Namespace) -> None:
         batch_images = []
         for prompt_hash in batch_hashes:
             with Image.open(hash_to_path[prompt_hash]) as image:
-                batch_images.append(image.convert("RGB"))
+                batch_images.append(image.copy())
 
         batch_outputs = encoder.encode_image_outputs(batch_images)
         for prompt_hash, embedding, probabilities in zip(
@@ -200,6 +203,11 @@ def build_cache(args: argparse.Namespace) -> None:
             "prompt_field": args.prompt_field,
             "image_field": args.image_field,
             "model_path": str(args.model_path),
+            "model_fingerprint": model_fingerprint,
+            "model_architecture": encoder.model_config["architecture"],
+            "model_num_classes": int(encoder.model_config["num_classes"]),
+            "model_num_features": int(encoder.model_config["num_features"]),
+            "preprocess_source": encoder.preprocess_spec.source,
             "reference_jsonl": str(args.reference_jsonl),
             "probability_activation": "sigmoid",
             "cache_fields": ["embeddings", "probabilities"],

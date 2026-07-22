@@ -45,10 +45,12 @@ from PIL import Image
 from process_worker_pool import ProcessWorkerPool
 from wd_prompt_hash_common import (
     WDEVA02EmbeddingModel,
+    get_default_wd_dtype,
     load_reference_cache_payload,
     negative_binary_cross_entropy_score,
     prompt_sha256,
     soft_jaccard_score,
+    validate_reference_cache_for_model,
     wd_distribution_reward,
 )
 
@@ -63,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("../models/wd-eva02-large-tagger-v3"),
-        help="Path to the local WD EVA02 tagger checkpoint directory.",
+        default=Path("../models/eva02_large_patch14_448.dbv4-full"),
+        help="Path to the local AnimeTimm EVA02 DBV4 tagger checkpoint directory.",
     )
     parser.add_argument(
         "--cache-path",
@@ -91,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
-        default="bfloat16" if torch.cuda.is_available() else "float32",
+        default=get_default_wd_dtype(),
         help="Torch dtype for CUDA inference. CPU inference always uses float32.",
     )
     parser.add_argument(
@@ -116,7 +118,8 @@ def _decode_base64_image(image_data: str) -> Image.Image:
     """Decode a base64 string or data URL into a PIL image."""
     payload = image_data.split(",", maxsplit=1)[-1]
     binary = base64.b64decode(payload)
-    return Image.open(BytesIO(binary)).convert("RGB")
+    with Image.open(BytesIO(binary)) as image:
+        return image.copy()
 
 
 def _resolve_media_payload(
@@ -273,6 +276,10 @@ class WDEVA02PromptHashService:
         self._loaded_on_device = False
 
         self.reference_cache = load_reference_cache_payload(cache_path)
+        self.model_fingerprint = validate_reference_cache_for_model(
+            reference_cache=self.reference_cache,
+            model_path=model_path,
+        )
         if self.score_type in {"soft_jaccard", "wd_distribution", "negative_bce"}:
             self.reference_cache.require_probabilities()
         if self.process_pool_enabled:
@@ -297,9 +304,10 @@ class WDEVA02PromptHashService:
             )
 
         LOGGER.info(
-            "Loaded %s WD reference entries from %s",
+            "Loaded %s WD reference entries from cache_path(%s) for model_path(%s)",
             len(self.reference_cache.embeddings),
             cache_path,
+            model_path,
         )
         LOGGER.info(
             "WD prompt-hash device config: device=%s dtype=%s visible_cuda_devices=%s "
@@ -544,6 +552,8 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "reference_count": len(self.service.reference_cache.embeddings),
                     "cache_path": str(self.service.cache_path),
+                    "model_path": str(self.service.model_path),
+                    "model_fingerprint": self.service.model_fingerprint,
                     "score_type": self.service.score_type,
                     "has_reference_probabilities": (
                         self.service.reference_cache.probabilities is not None

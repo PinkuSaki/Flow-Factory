@@ -603,6 +603,43 @@ rewards:
     retry_attempts: 3    # optional, default 3
 ```
 
+### WD DBV4 Prompt-Hash Similarity Server
+
+The WD server compares generated images against prompt-indexed reference images
+using the local AnimeTimm EVA02 DBV4 full tagger. Build a cache with the same model
+that the server will load:
+
+```bash
+python scripts/reward_servers/build_wd_prompt_hash_cache.py \
+  --model-path ../models/eva02_large_patch14_448.dbv4-full \
+  --reference-jsonl dataset/refs.jsonl \
+  --image-field source_image \
+  --cache-path caches/wd_dbv4_refs.pt \
+  --device cuda \
+  --dtype float16 \
+  --overwrite
+```
+
+Then start the server with one of `embedding_cosine`, `soft_jaccard`,
+`wd_distribution`, or `negative_bce`:
+
+```bash
+python scripts/reward_servers/wd_prompt_hash_server.py \
+  --host 127.0.0.1 \
+  --port 18082 \
+  --model-path ../models/eva02_large_patch14_448.dbv4-full \
+  --cache-path caches/wd_dbv4_refs.pt \
+  --device cuda \
+  --dtype float16 \
+  --score-type negative_bce
+```
+
+The DBV4 adapter follows the checkpoint's `preprocess.json` test pipeline and
+produces 12,476 independent sigmoid tag probabilities. Cache metadata includes a
+fingerprint over the model config, preprocessing config, and weights; the server
+fails fast if the cache was built with another checkpoint. Rebuild the cache after
+changing any of those files.
+
 ### Prompt-Hash Wavelet Similarity Server
 
 For reference-image style or texture matching, Flow-Factory includes a lightweight
