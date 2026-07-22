@@ -23,6 +23,21 @@ Throughout the codebase, two related but distinct scales are used for time:
 1. **Don't divide `t` by 1000 before passing to `adapter.forward()`** — the adapter handles internal conversion.
 2. **`timestep_range` uses denoising-axis fractions, not raw timesteps** — `(0, 0.5)` means the noisier half `t ∈ [500, 1000]`, not the cleaner half.
 3. **`flow_match_sigma()` is the only sanctioned conversion** — do not use `t / 1000` directly; use the function for traceability.
+4. **Anima inference requires an explicit raw sigma grid** — `sd-scripts` constructs
+   `linspace(1, 0, num_inference_steps + 1)` and then applies `discrete_flow_shift`. Calling
+   Diffusers `set_timesteps(num_inference_steps=...)` without explicit sigmas uses a different
+   grid. Pass the terminal-excluded raw sigmas to `set_timesteps(sigmas=...)`; the scheduler
+   appends the terminal zero and applies its configured shift.
+
+## Recorded Fix Patterns
+
+### [Anima Inference Must Supply the sd-scripts Raw Sigma Grid]
+- **Date**: 2026-07-23
+- **Symptom**: Setting `model.discrete_flow_shift: 3.0` did not reproduce the timestep and sigma sequence from `sd-scripts --flow_shift 3` inference.
+- **Root Cause**: The Anima adapter delegated raw sigma construction to Diffusers, whose default `set_timesteps(num_inference_steps=...)` grid differs from the linear terminal-inclusive grid used by `sd-scripts`.
+- **Fix**: Updated `src/flow_factory/models/anima/anima.py` to pass terminal-excluded raw linear sigmas explicitly before the scheduler applies `discrete_flow_shift`, and documented the inference mapping in `guidance/anima_support.md`.
+- **Lesson**: Matching a scheduler shift parameter is insufficient for inference parity; the pre-shift sigma grid and terminal convention must also match the reference pipeline.
+- **Related Constraint**: N/A
 
 ## Cross-refs
 

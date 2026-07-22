@@ -89,6 +89,20 @@ def _load_optional_state_dict(path: str) -> Dict[str, torch.Tensor]:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
+def _set_anima_inference_timesteps(
+    scheduler: DiffusersFlowMatchEulerDiscreteScheduler,
+    num_inference_steps: int,
+    device: torch.device,
+) -> None:
+    """Configure the sd-scripts shifted-linear sigma schedule for Anima inference."""
+    raw_sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1, dtype=torch.float32)[:-1]
+    scheduler.set_timesteps(
+        num_inference_steps=num_inference_steps,
+        sigmas=raw_sigmas.tolist(),
+        device=device,
+    )
+
+
 def _get_anima_param_groups(
     transformer: torch.nn.Module,
     base_lr: float,
@@ -781,7 +795,11 @@ class AnimaAdapter(BaseAdapter):
             dtype=dtype,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device)
+        _set_anima_inference_timesteps(
+            self.scheduler,
+            num_inference_steps=num_inference_steps,
+            device=device,
+        )
         timesteps = self.scheduler.timesteps
 
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)

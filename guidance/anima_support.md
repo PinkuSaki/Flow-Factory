@@ -33,6 +33,29 @@ Key behaviors:
 - Normalizes timesteps to `[0, 1]` before calling the Anima transformer.
 - Supports classifier-free guidance with separate negative prompt encodings.
 - Reuses Flow-Factory's SDE scheduler and trajectory collection path.
+- Builds the inference schedule from raw sigmas linearly spaced from `1` toward `0`, then
+  applies `model.discrete_flow_shift` inside the scheduler. This matches the Euler schedule
+  used by `sd-scripts` Anima inference; `train.time_sampling_strategy` remains a training-only
+  setting.
+
+For strict `sd-scripts --flow_shift 3` standalone inference parity, or for sampling with a
+decoupled trainer, use:
+
+```yaml
+model:
+  discrete_flow_shift: 3.0
+
+scheduler:
+  dynamics_type: ODE
+```
+
+Coupled trainers (`grpo`, `grpo-guard`, and `dppo`) must keep an SDE dynamics type during
+training rollout. Their evaluation path switches the scheduler to deterministic evaluation mode
+without changing the training dynamics configuration.
+
+Also align `num_inference_steps`, guidance scale, seed, resolution, precision, prompts, and LoRA
+multiplier. Passing only `num_inference_steps` to Diffusers does not construct the same raw sigma
+grid, so the Anima adapter supplies that grid explicitly before the scheduler applies the shift.
 
 ### Configuration surface
 
